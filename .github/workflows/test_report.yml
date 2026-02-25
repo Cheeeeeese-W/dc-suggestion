@@ -1,0 +1,33 @@
+name: Manual Test Discord Report
+
+on:
+  workflow_dispatch: # 这个配置允许你在网页上点击按钮立即运行
+  schedule:
+    - cron: '0 2 * * 1' # 每周一北京时间上午 10:00 (UTC 2:00)
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install discord.py openai requests python-dotenv
+
+      - name: Run Script
+        env:
+          # 将 GitHub Secrets 映射给脚本的环境变量
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_KEYWORD: "建议"
+        run: python discord_weekly_report.py
