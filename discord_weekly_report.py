@@ -39,13 +39,21 @@ def get_last_week_range():
     return last_monday, last_sunday
 
 def analyze_with_ai(content):
-    """直接使用 Google 官方 Gemini 库进行分析"""
+    """使用 Google 官方 Gemini 库，带自动纠错逻辑"""
     try:
-        # 配置 API Key
+        # 1. 配置 API Key
         genai.configure(api_key=CONF["AI_API_KEY"])
         
-        # 初始化模型 (CONF["AI_MODEL"] 填 gemini-1.5-flash 即可)
-        model = genai.GenerativeModel(model_name=CONF["AI_MODEL"])
+        # 2. 预处理模型名称 (去除可能存在的空格)
+        model_name = CONF["AI_MODEL"].strip()
+        
+        # 3. 尝试初始化模型
+        # 如果模型名不含 'models/'，SDK 有时会报错，这里做自动补充
+        full_model_name = model_name if model_name.startswith("models/") else f"models/{model_name}"
+        
+        print(f"尝试调用的模型全称: {full_model_name}")
+        
+        model = genai.GenerativeModel(model_name=full_model_name)
         
         prompt = f"""
         你是一个游戏社区数据分析师。请对以下 Discord 玩家提给出的{CONF['KEYWORD']}进行周报总结。
@@ -60,13 +68,23 @@ def analyze_with_ai(content):
         {content}
         """
         
-        # 生成内容
+        # 4. 生成内容
         response = model.generate_content(prompt)
         
-        # 返回结果文本
-        return response.text
-        
+        # 5. 返回结果文本
+        if response.text:
+            return response.text
+        else:
+            return "AI 未能生成有效文本，请检查输入数据。"
+            
     except Exception as e:
+        # 如果报错，打印出模型列表，方便调试（仅在日志中可见）
+        print("--- 调试信息：当前 API Key 可用的模型列表 ---")
+        try:
+            for m in genai.list_models():
+                print(f"可用模型: {m.name}")
+        except:
+            pass
         return f"Gemini 分析过程中出现异常: {str(e)}"
 
 def push_to_feishu(text, date_str):
