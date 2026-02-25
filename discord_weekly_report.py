@@ -15,7 +15,6 @@ def get_env_config():
         "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
         "CHANNEL_ID": int(os.getenv("DISCORD_CHANNEL_ID", 0)),
         "AI_API_KEY": os.getenv("AI_API_KEY"),
-        "AI_BASE_URL": os.getenv("AI_BASE_URL", "https://api.openai.com/v1"),
         "AI_MODEL": os.getenv("AI_MODEL", "gemini-1.5-flash"),
         "FEISHU_URL": os.getenv("FEISHU_WEBHOOK_URL"),
         "KEYWORD": os.getenv("FEISHU_KEYWORD", "建议")
