@@ -34,13 +34,18 @@ class FeishuClient:
     def _get_tenant_access_token(self):
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         res = requests.post(url, json={"app_id": CONF["FEISHU_APP_ID"], "app_secret": CONF["FEISHU_APP_SECRET"]})
-        return res.json().get("tenant_access_token")
+        data = res.json()
+        if data.get("code") != 0:
+            print(f"❌ 飞书鉴权失败! 请检查 AppID/Secret。错误信息: {data.get('msg')}")
+            return None
+        return data.get("tenant_access_token")
 
     def add_bitable_record(self, fields):
         if not self.token: return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        # 飞书多维表格需要的字段映射
+        
+        # 严格按照多维表格字段构造
         payload = {
             "fields": {
                 "日期": fields.get("日期"),
@@ -52,7 +57,12 @@ class FeishuClient:
                 "帖子链接": fields.get("帖子链接")
             }
         }
-        requests.post(url, headers=headers, json=payload)
+        res = requests.post(url, headers=headers, json=payload)
+        res_data = res.json()
+        if res_data.get("code") != 0:
+            print(f"❌ 多维表格写入失败! 标题: {fields.get('标题')} | 错误: {res_data.get('msg')}")
+        else:
+            print(f"✅ 已成功录入多维表格: {fields.get('标题')}")
 
     def send_group_card(self, card_content):
         if not self.token: return
@@ -64,7 +74,11 @@ class FeishuClient:
             "content": json.dumps(card_content)
         }
         res = requests.post(url, headers=headers, json=payload)
-        print(f"飞书推送结果: {res.json().get('msg')}")
+        res_data = res.json()
+        if res_data.get("code") != 0:
+            print(f"❌ 飞书群卡片发送失败! 错误: {res_data.get('msg')} | 详情: {res_data}")
+        else:
+            print(f"✅ 飞书群周报卡片发送成功！")
 
 # ===================== Discord 机器人主逻辑 =====================
 class AdvancedBot(discord.Client):
