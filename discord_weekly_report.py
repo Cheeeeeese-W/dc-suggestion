@@ -92,55 +92,78 @@ def push_to_feishu(text, date_str):
 
 class ReportBot(discord.Client):
     async def on_ready(self):
-        print(f"已连接 Discord: {self.user}")
-        channel = self.get_channel(CONF["CHANNEL_ID"])
-        if not channel:
-            print("错误：无法访问指定频道，请检查 ID 或机器人权限。")
-            await self.close()
-            return
+            print(f"已连接 Discord: {self.user}")
+            channel = self.get_channel(CONF["CHANNEL_ID"])
+            if not channel:
+                print("错误：无法访问指定频道，请检查 ID 或机器人权限。")
+                await self.close()
+                return
 
-        start_time, end_time = get_last_week_range()
-        date_display = f"{start_time.strftime('%Y/%m/%d')} - {end_time.strftime('%m/%d')}"
-        
-        messages = []
-
-        # --- 情况 A: 如果是普通文本频道 ---
-        if isinstance(channel, discord.TextChannel):
-            print(f"正在读取文本频道消息: {date_display}...")
-            async for message in channel.history(limit=2000, after=start_time, before=end_time):
-                if not message.author.bot and len(message.content) > 2:
-                    messages.append(f"[{message.author.name}]: {message.content}")
-
-        # --- 情况 B: 如果是论坛频道 (Forum Channel) ---
-        elif isinstance(channel, discord.ForumChannel):
-            print(f"检测到论坛频道，正在获取上周创建的帖子: {date_display}...")
+            start_time, end_time = get_last_week_range()
+            date_display = f"{start_time.strftime('%Y/%m/%d')} - {end_time.strftime('%m/%d')}"
             
-            # 1. 检查当前活跃的帖子
-            for thread in channel.threads:
-                if start_time <= thread.created_at <= end_time:
-                    messages.append(f"[用户:{thread.owner}] 标题: {thread.name}")
-            
-            # 2. 检查已归档的帖子 (上周的建议很可能已经被管理员归档了)
-            async for thread in channel.archived_threads(before=end_time, limit=100):
-                if thread.created_at < start_time:
-                    break # 已经早于上周一，停止搜索
-                messages.append(f"[用户:{thread.owner}] 标题: {thread.name}")
-        
-        else:
-            print(f"暂不支持的频道类型: {type(channel)}")
-            await self.close()
-            return
+            messages = []
 
-        # --- AI 分析与推送 ---
-        if messages:
-            print(f"共获取到 {len(messages)} 条内容，正在调用 AI 分析...")
-            report_summary = analyze_with_ai("\n".join(messages))
-            push_to_feishu(report_summary, date_display)
-            print("报告已生成并发送至飞书。")
-        else:
-            print("该时间段内无新建议，跳过报告生成。")
-        
-        await self.close()
+            # --- 情况 A: 普通文本频道 ---
+            if isinstance(channel, discord.TextChannel):
+                print(f"正在读取文本频道消息: {date_display}...")
+                async for message in channel.history(limit=2000, after=start_time, before=end_time):
+                    if not message.author.bot and len(message.content) > 2:
+                        messages.append(f"[{message.author.name}]: {message.content}")
+
+            # --- 情况 B: 论坛频道 (Forum Channel) ---
+            elif isinstance(channel, discord.ForumChannel):
+                print(f"检测到论坛频道，正在抓取上周帖子的正文内容...")
+                
+                # 合并活跃帖子和归档帖子进行处理
+                all_threads = []
+                
+                # 1. 获取活跃帖子
+                for thread in channel.threads:
+                    if start_time <= thread.created_at <= end_time:
+                        all_threads.append(thread)
+                
+                # 2. 获取归档帖子
+                async for thread in channel.archived_threads(before=end_time, limit=100):
+                    if thread.created_at < start_time:
+                        break
+                    all_threads.append(thread)
+
+                print(f"找到上周创建的帖子共 {len(all_threads)} 个，开始提取正文...")
+
+                for thread in all_threads:
+                    try:
+                        # 在 Discord 中，帖子的 ID 就是第一条消息的 ID
+                        starter_message = await thread.fetch_message(thread.id)
+                        content = starter_message.content
+                        # 将标题和正文组合在一起
+                        messages.append(f"【建议标题：{thread.name}】\n内容：{content}")
+                    except Exception as e:
+                        print(f"无法获取帖子 '{thread.name}' 的正文: {e}")
+                        # 如果获取不到正文，至少保留标题
+                        messages.append(f"【建议标题：{thread.name}】 (正文提取失败)")
+            
+            else:
+                print(f"暂不支持的频道类型: {type(channel)}")
+                await self.close()
+                return
+
+            # --- AI 分析与推送 ---
+            if messages:
+                print(f"共获取到 {len(messages)} 条内容，正在调用 AI 分析...")
+                raw_data = "\n\n---\n\n".join(messages)
+                
+                # 防止数据过长导致 AI 接口报错（针对 Gemini 1.5 Flash 这个问题不严重，但建议保留）
+                if len(raw_data) > 30000:
+                    raw_data = raw_data[:30000] + "\n...(内容过多已截断)"
+                    
+                report_summary = analyze_with_ai(raw_data)
+                push_to_feishu(report_summary, date_display)
+                print("✅ 报告已生成并发送至飞书。")
+            else:
+                print("📭 该时间段内无新建议，跳过报告生成。")
+            
+            await self.close()
 
 if __name__ == "__main__":
     intents = discord.Intents.default()
