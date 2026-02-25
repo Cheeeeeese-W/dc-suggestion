@@ -81,12 +81,13 @@ class AdvancedBot(discord.Client):
 
         feishu = FeishuClient()
         genai.configure(api_key=CONF["AI_API_KEY"])
+        # 使用异步模型接口
         ai_model = genai.GenerativeModel(CONF["AI_MODEL"])
         
         start_time, end_time = self.get_range()
         date_display = f"{start_time.strftime('%Y/%m/%d')} - {end_time.strftime('%m/%d')}"
         
-        # 1. 第一步：抓取所有帖子
+        # 1. 抓取帖子
         threads = []
         async for t in channel.archived_threads(before=end_time, limit=100):
             if t.created_at >= start_time: threads.append(t)
@@ -103,7 +104,6 @@ class AdvancedBot(discord.Client):
                     starter_msg = await thread.fetch_message(thread.id)
                 except:
                     async for m in thread.history(limit=1, oldest_first=True): starter_msg = m
-                
                 if not starter_msg: continue
 
                 reaction_count = sum([r.count for r in starter_msg.reactions])
@@ -111,9 +111,7 @@ class AdvancedBot(discord.Client):
                 async for msg in thread.history(limit=15): unique_users.add(msg.author.id)
 
                 raw_threads_data.append({
-                    "id": index,
-                    "标题": thread.name,
-                    "内容": starter_msg.content[:500],
+                    "id": index, "标题": thread.name, "内容": starter_msg.content[:500],
                     "热度分": (thread.message_count * 3) + (reaction_count * 1),
                     "参与人数": len(unique_users),
                     "帖子链接": f"https://discord.com/channels/{thread.guild.id}/{thread.id}",
@@ -123,13 +121,11 @@ class AdvancedBot(discord.Client):
                 print(f"⚠️ 预处理帖子 {thread.name} 失败: {e}")
 
         if not raw_threads_data:
-            print("📭 无有效内容，任务结束"); await self.close(); return
+            print("📭 无有效内容"); await self.close(); return
 
-        # 2. 第二步：AI 批量分析
+        # 2. AI 批量分析 (关键修改：使用 generate_content_async)
         print(f"🤖 正在向 AI 发起批量请求 (包含 {len(raw_threads_data)} 条建议)...")
-        items_str = ""
-        for item in raw_threads_data:
-            items_str += f"ID: {item['id']} | 标题: {item['标题']} | 内容: {item['内容']}\n"
+        items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_threads_data])
 
         prompt = f"""
         你是一个游戏社区数据分析师。请分析以下玩家建议。
@@ -138,12 +134,14 @@ class AdvancedBot(discord.Client):
         - sentiment: 情绪打分(1-10)
         - category: 模块分类(选一：战斗平衡、赛季机制、日常活动、BUG反馈、UI交互)
         - summary: 一句话建议总结(含“建议”二字)
-        数据清单：\n{items_str}
+        数据：\n{items_str}
         """
 
         all_enriched_data = []
         try:
-            response = ai_model.generate_content(prompt)
+            # --- 使用 await 和 generate_content_async 防止阻塞心跳 ---
+            response = await ai_model.generate_content_async(prompt)
+            
             json_str = response.text.replace('```json', '').replace('```', '').strip()
             ai_results = json.loads(json_str)
             ai_map = {item['id']: item for item in ai_results}
@@ -157,19 +155,25 @@ class AdvancedBot(discord.Client):
                     "AI核心总结": ai_info.get('summary', original['标题'])
                 }
                 all_enriched_data.append(enriched_item)
-                # 写入多维表格
                 feishu.add_bitable_record(enriched_item)
                 print(f"✅ 已归档: {original['标题']}")
+                # 小技巧：每写一行稍微歇一下，让出心跳时间
+                await asyncio.sleep(0.1) 
 
         except Exception as e:
-            print(f"❌ AI 分析失败: {e}")
+            print(f"❌ AI 分析或归档失败: {e}")
             for original in raw_threads_data:
                 all_enriched_data.append({**original, "情绪得分": 5, "模块分类": "未分类", "AI核心总结": original['标题']})
 
-        # 4. 第四步：推送汇总卡片
+        # 4. 推送汇总卡片
         if all_enriched_data:
-            await self.send_weekly_card(all_enriched_data, feishu, date_display)
+            print("🚀 准备推送飞书周报卡片...")
+            try:
+                await self.send_weekly_card(all_enriched_data, feishu, date_display)
+            except Exception as e:
+                print(f"❌ 飞书卡片推送失败: {e}")
         
+        print("🎉 任务圆满完成。")
         await self.close()
 
     async def send_weekly_card(self, data, feishu_client, date_str):
