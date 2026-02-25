@@ -2,7 +2,7 @@ import os
 import discord
 import requests
 import json
-import openai
+import google.generativeai as genai
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
@@ -40,28 +40,35 @@ def get_last_week_range():
     return last_monday, last_sunday
 
 def analyze_with_ai(content):
-    """调用 AI 分析内容"""
-    client = openai.OpenAI(api_key=CONF["AI_API_KEY"], base_url=CONF["AI_BASE_URL"])
-    prompt = f"""
-    你是一个游戏社区数据分析师。请对以下 Discord 玩家提给出的{CONF['KEYWORD']}进行周报总结。
-    
-    要求：
-    1. 归纳 3 个最核心的玩家关注点。
-    2. 按分类（Bug、体验优化、新功能、平衡性）列出要点。
-    3. 必须包含关键词：{CONF['KEYWORD']}。
-    4. 采用 Markdown 格式，输出要精简、专业。
-
-    数据：
-    {content}
-    """
+    """直接使用 Google 官方 Gemini 库进行分析"""
     try:
-        response = client.chat.completions.create(
-            model=CONF["AI_MODEL"],
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
+        # 配置 API Key
+        genai.configure(api_key=CONF["AI_API_KEY"])
+        
+        # 初始化模型 (CONF["AI_MODEL"] 填 gemini-1.5-flash 即可)
+        model = genai.GenerativeModel(model_name=CONF["AI_MODEL"])
+        
+        prompt = f"""
+        你是一个游戏社区数据分析师。请对以下 Discord 玩家提给出的{CONF['KEYWORD']}进行周报总结。
+        
+        要求：
+        1. 归纳 3 个最核心的玩家关注点。
+        2. 按分类（Bug、体验优化、新功能、平衡性）列出要点。
+        3. 必须包含关键词：{CONF['KEYWORD']}。
+        4. 采用 Markdown 格式，输出要精简、专业。
+
+        数据：
+        {content}
+        """
+        
+        # 生成内容
+        response = model.generate_content(prompt)
+        
+        # 返回结果文本
+        return response.text
+        
     except Exception as e:
-        return f"AI 分析过程中出现异常: {str(e)}"
+        return f"Gemini 分析过程中出现异常: {str(e)}"
 
 def push_to_feishu(text, date_str):
     """推送飞书卡片"""
