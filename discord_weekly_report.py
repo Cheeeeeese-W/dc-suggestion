@@ -190,9 +190,10 @@ class AdvancedBot(discord.Client):
         1. 输出必须为简体中文。
         2. 如果建议涉及多个系统，category 和 sub_category 请使用列表。
         3. summary 必须是对建议的一句话精炼总结。
-        4. sentiment 为 1-10 分，分数越高代表玩家越愤怒（10 最愤怒，1 最平和）。
+        4. short_title 必须是 10 字以内的中文短标题，用于卡片展示。
+        5. sentiment 为 1-10 分，分数越高代表玩家越愤怒（10 最愤怒，1 最平和）。
 
-        输出字段: id, sentiment(1-10), category(list), sub_category(list), summary(中文)。
+        输出字段: id, sentiment(1-10), category(list), sub_category(list), short_title(10字以内), summary(中文)。
         数据：\n{items_str}"""
 
         all_enriched, new_kb_records = [], set()
@@ -262,6 +263,7 @@ class AdvancedBot(discord.Client):
                     "模块分类": c1,
                     "二级分类": c2,
                     "情绪得分": int(ai_info.get('sentiment', 5)),
+                    "AI短标题": str(ai_info.get('short_title') or ai_info.get('title') or ai_info.get('summary', o['标题'])),
                     "AI核心总结": str(ai_info.get('summary', o['标题'])),
                     # 参与人数：优先使用前面 raw_data 中真实统计到的参与人数，兜底为 1
                     "参与人数": int(o.get("参与人数", 1)) or 1
@@ -282,13 +284,19 @@ class AdvancedBot(discord.Client):
                     cat_groups[sub_cat] = {
                         "name": sub_cat, "cat1": item["模块分类"][0],
                         "heat": 0, "count": 0, "user_count": 0,
-                        "sentiment_total": 0, "summary": item["AI核心总结"]
+                        "sentiment_total": 0,
+                        "summary": item["AI核心总结"],
+                        "short_title": item.get("AI短标题", item["AI核心总结"]),
+                        "cat1_set": set(item.get("模块分类", []) or [item["模块分类"][0]])
                     }
                 g = cat_groups[sub_cat]
                 g["heat"] += item["热度分"]
                 g["count"] += 1
                 g["user_count"] += int(item.get("参与人数", 1)) or 1
                 g["sentiment_total"] += int(item.get("情绪得分", 5))
+                for cat1 in item.get("模块分类", []):
+                    if str(cat1).strip():
+                        g["cat1_set"].add(str(cat1).strip())
 
         summary_list = []
         for v in cat_groups.values():
@@ -296,6 +304,8 @@ class AdvancedBot(discord.Client):
                 "topic": v["name"], "category": v["cat1"],
                 "total_heat": v["heat"], "thread_count": v["count"],
                 "user_count": v["user_count"], "summary": v["summary"],
+                "short_title": v.get("short_title", v["summary"]),
+                "tag_list": [f"{cat}-{v['name']}" for cat in sorted(v.get("cat1_set", {v['cat1']}))],
                 "avg_sentiment": round(v["sentiment_total"] / v["count"], 1) if v["count"] else 5.0
             })
 
@@ -337,16 +347,20 @@ class AdvancedBot(discord.Client):
             score_color = self._sentiment_color(score)
             summary = str(item.get("summary", "")).replace("\n", " ").strip()
             summary = (summary[:88] + "...") if len(summary) > 88 else summary
-            short_summary = (summary[:22] + "...") if len(summary) > 22 else summary
+            short_title = str(item.get("short_title", "")).replace("\n", " ").strip()[:10]
+            short_summary = short_title or summary[:10]
 
             if i == 0:
                 title_md = f"<font color='red'>**TOP 1 · {short_summary or item['topic']}**</font>"
             else:
                 title_md = f"**TOP {i+1} · {short_summary or item['topic']}**"
 
-            category = str(item.get("category", "未分类")).strip() or "未分类"
-            topic = str(item.get("topic", "未分类")).strip() or "未分类"
-            cat_line = f"#{category}-{topic}"
+            tag_list = item.get("tag_list") or []
+            if not tag_list:
+                category = str(item.get("category", "未分类")).strip() or "未分类"
+                topic = str(item.get("topic", "未分类")).strip() or "未分类"
+                tag_list = [f"{category}-{topic}"]
+            cat_line = " ".join([f"#{t}" for t in tag_list[:4]])
 
             el.append({
                 "tag": "column_set",
@@ -437,9 +451,15 @@ class AdvancedBot(discord.Client):
             )
         }, {"tag": "hr"}]
         for i, item in enumerate(st):
-            short_summary = str(item.get("summary", "")).replace("\n", " ").strip()
-            short_summary = (short_summary[:22] + "...") if len(short_summary) > 22 else short_summary
+            short_title = str(item.get("short_title", "")).replace("\n", " ").strip()[:10]
+            short_summary = short_title or str(item.get("summary", "")).replace("\n", " ").strip()[:10]
             summary_90 = str(item.get("summary", "")).replace("\n", " ")[:90]
+            fallback_tag_list = item.get("tag_list") or []
+            if not fallback_tag_list:
+                fallback_category = str(item.get("category", "未分类")).strip() or "未分类"
+                fallback_topic = str(item.get("topic", "未分类")).strip() or "未分类"
+                fallback_tag_list = [f"{fallback_category}-{fallback_topic}"]
+            fallback_tag_line = " ".join([f"#{t}" for t in fallback_tag_list[:4]])
             fallback_el.append({
                 "tag": "markdown",
                 "content": (
@@ -447,7 +467,7 @@ class AdvancedBot(discord.Client):
                     f"{summary_90}\n"
                     f"🔥 {int(item['total_heat'])} | 🙂 {float(item.get('avg_sentiment', 5.0)):.1f} | "
                     f"📝 {int(item['thread_count'])} | 👥 {int(item['user_count'])} | "
-                    f"#{str(item.get('category', '未分类')).strip() or '未分类'}-{str(item.get('topic', '未分类')).strip() or '未分类'}"
+                    f"{fallback_tag_line}"
                 )
             })
         fallback_el.append({"tag": "action", "actions": [{
