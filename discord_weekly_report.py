@@ -45,7 +45,10 @@ class FeishuClient:
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         
-        # 严格按照多维表格字段构造
+        # 构造符合飞书“超链接”字段要求的对象
+        post_link = fields.get("帖子链接")
+        link_field = {"text": "点击查看帖子", "link": post_link} if post_link else None
+
         payload = {
             "fields": {
                 "日期": fields.get("日期"),
@@ -54,7 +57,7 @@ class FeishuClient:
                 "参与人数": fields.get("参与人数"),
                 "AI核心总结": fields.get("AI核心总结"),
                 "情绪得分": fields.get("情绪得分"),
-                "帖子链接": fields.get("帖子链接")
+                "帖子链接": link_field  # 发送对象而不是纯字符串
             }
         }
         res = requests.post(url, headers=headers, json=payload)
