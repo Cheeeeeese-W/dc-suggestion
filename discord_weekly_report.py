@@ -23,7 +23,11 @@ def get_conf():
         "BITABLE_TOKEN": os.getenv("FEISHU_BITABLE_APP_TOKEN"),
         "BITABLE_TABLE_ID": os.getenv("FEISHU_BITABLE_TABLE_ID"),
         "REFERENCE_TABLE_ID": os.getenv("FEISHU_REFERENCE_TABLE_ID"),
-        "FEISHU_CHAT_ID": os.getenv("FEISHU_CHAT_ID")
+        "FEISHU_CHAT_ID": os.getenv("FEISHU_CHAT_ID"),
+        # 发送模式：prod 发群；test 发指定个人（open_id/user_id/union_id/chat_id 均可）
+        "FEISHU_SEND_MODE": os.getenv("FEISHU_SEND_MODE", "prod"),
+        "FEISHU_TEST_RECEIVE_ID": os.getenv("FEISHU_TEST_RECEIVE_ID"),
+        "FEISHU_TEST_RECEIVE_ID_TYPE": os.getenv("FEISHU_TEST_RECEIVE_ID_TYPE", "open_id")
     }
 
 CONF = get_conf()
@@ -96,16 +100,29 @@ class FeishuClient:
 
     def send_group_card(self, card_content):
         if not self.token: return
-        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+        mode = str(CONF.get("FEISHU_SEND_MODE", "prod")).strip().lower()
+        if mode == "test":
+            receive_id = CONF.get("FEISHU_TEST_RECEIVE_ID")
+            receive_id_type = str(CONF.get("FEISHU_TEST_RECEIVE_ID_TYPE", "open_id")).strip() or "open_id"
+            # 测试模式未配置个人接收者时，自动回退到群，避免消息丢失
+            if not receive_id:
+                print("⚠️ FEISHU_SEND_MODE=test 但未配置 FEISHU_TEST_RECEIVE_ID，已回退群聊发送")
+                receive_id = CONF.get("FEISHU_CHAT_ID")
+                receive_id_type = "chat_id"
+        else:
+            receive_id = CONF.get("FEISHU_CHAT_ID")
+            receive_id_type = "chat_id"
+
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        payload = {"receive_id": CONF["FEISHU_CHAT_ID"], "msg_type": "interactive", "content": json.dumps(card_content)}
+        payload = {"receive_id": receive_id, "msg_type": "interactive", "content": json.dumps(card_content)}
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=10)
             data = res.json()
             if data.get("code") != 0:
                 print(f"❌ 飞书卡片发送失败: code={data.get('code')} msg={data.get('msg')}")
                 return False
-            print("✅ 飞书卡片发送成功")
+            print(f"✅ 飞书卡片发送成功 (mode={mode}, receive_id_type={receive_id_type})")
             return True
         except Exception as e:
             print(f"❌ 飞书卡片发送异常: {e}")
