@@ -270,19 +270,22 @@ class AdvancedBot(discord.Client):
                 if sub_cat not in cat_groups:
                     cat_groups[sub_cat] = {
                         "name": sub_cat, "cat1": item["模块分类"][0],
-                        "heat": 0, "count": 0, "users": set(), "summary": item["AI核心总结"]
+                        "heat": 0, "count": 0, "user_count": 0,
+                        "sentiment_total": 0, "summary": item["AI核心总结"]
                     }
                 g = cat_groups[sub_cat]
                 g["heat"] += item["热度分"]
                 g["count"] += 1
-                g["users"].add(item["owner_id"])
+                g["user_count"] += int(item.get("参与人数", 1)) or 1
+                g["sentiment_total"] += int(item.get("情绪得分", 5))
 
         summary_list = []
         for v in cat_groups.values():
             summary_list.append({
                 "topic": v["name"], "category": v["cat1"],
                 "total_heat": v["heat"], "thread_count": v["count"],
-                "user_count": len(v["users"]), "summary": v["summary"]
+                "user_count": v["user_count"], "summary": v["summary"],
+                "avg_sentiment": round(v["sentiment_total"] / v["count"], 1) if v["count"] else 5.0
             })
 
         if summary_list:
@@ -293,9 +296,23 @@ class AdvancedBot(discord.Client):
         await self.close()
 
     async def send_weekly_card(self, st, fs, start_dt):
-        el = [{"tag": "markdown", "content": f"**📊 上周社区二级分类热度榜**\n根据玩家反馈热度自动聚合。"}, {"tag": "hr"}]
+        el = [{
+            "tag": "markdown",
+            "content": (
+                "**📊 上周社区二级分类热度榜**\n"
+                "热度分 = 帖子消息量与互动反应的综合分；情绪分 = AI 对建议情绪强度的 1-10 分评估。"
+            )
+        }, {"tag": "hr"}]
         for i, item in enumerate(st):
-            el.append({"tag": "markdown", "content": f"**TOP {i+1}: {item['topic']}**\n诉求摘要: {item['summary'][:100]}\n🔥 总热度 {item['total_heat']} | 📑 {item['thread_count']} 篇建议 | 👥 {item['user_count']} 人关注 | #{item['category']}"})
+            el.append({
+                "tag": "markdown",
+                "content": (
+                    f"**TOP {i+1}: {item['topic']}**\n"
+                    f"诉求摘要: {item['summary'][:100]}\n"
+                    f"🔥 总热度 {item['total_heat']} | 🙂 情绪分 {item['avg_sentiment']} | "
+                    f"📑 {item['thread_count']} 篇建议 | 👥 {item['user_count']} 人关注 | #{item['category']}"
+                )
+            })
         el.append({"tag": "hr"})
         el.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
         fs.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 玩家建议周报 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"}, "template": "blue"}, "elements": el})
