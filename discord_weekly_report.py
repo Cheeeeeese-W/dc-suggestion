@@ -7,7 +7,6 @@ import google.generativeai as genai
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
-# 加载环境变量
 load_dotenv()
 
 # ===================== 配置中心 =====================
@@ -34,38 +33,34 @@ class FeishuClient:
     def _get_tenant_access_token(self):
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         res = requests.post(url, json={"app_id": CONF["FEISHU_APP_ID"], "app_secret": CONF["FEISHU_APP_SECRET"]})
-        data = res.json()
-        if data.get("code") != 0:
-            print(f"❌ 飞书鉴权失败! 请检查 AppID/Secret。错误信息: {data.get('msg')}")
-            return None
-        return data.get("tenant_access_token")
+        return res.json().get("tenant_access_token")
 
-    def add_bitable_record(self, fields):
-        if not self.token: return
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records"
+    def batch_add_bitable_records(self, records_list):
+        """批量写入记录，效率更高"""
+        if not self.token or not records_list: return
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_create"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         
-        # 构造符合飞书“超链接”字段要求的对象
-        post_link = fields.get("帖子链接")
-        link_field = {"text": "点击查看帖子", "link": post_link} if post_link else None
-
-        payload = {
-            "fields": {
-                "日期": fields.get("日期"),
-                "模块分类": fields.get("模块分类"),
-                "热度分": fields.get("热度分"),
-                "参与人数": fields.get("参与人数"),
-                "AI核心总结": fields.get("AI核心总结"),
-                "情绪得分": fields.get("情绪得分"),
-                "帖子链接": link_field  # 发送对象而不是纯字符串
-            }
-        }
-        res = requests.post(url, headers=headers, json=payload)
-        res_data = res.json()
-        if res_data.get("code") != 0:
-            print(f"❌ 多维表格写入失败! 标题: {fields.get('标题')} | 错误: {res_data.get('msg')}")
+        formatted_records = []
+        for fields in records_list:
+            formatted_records.append({
+                "fields": {
+                    "日期": fields.get("日期"),
+                    "模块分类": fields.get("模块分类"),
+                    "二级分类": fields.get("二级分类"),
+                    "热度分": fields.get("热度分"),
+                    "参与人数": fields.get("参与人数"),
+                    "AI核心总结": fields.get("AI核心总结"),
+                    "情绪得分": fields.get("情绪得分"),
+                    "帖子链接": {"text": "点击查看帖子", "link": fields.get("帖子链接")}
+                }
+            })
+        
+        res = requests.post(url, headers=headers, json={"records": formatted_records})
+        if res.json().get("code") == 0:
+            print(f"✅ 成功批量同步 {len(records_list)} 条记录到多维表格")
         else:
-            print(f"✅ 已成功录入多维表格: {fields.get('标题')}")
+            print(f"❌ 多维表格同步失败: {res.text}")
 
     def send_group_card(self, card_content):
         if not self.token: return
@@ -76,12 +71,7 @@ class FeishuClient:
             "msg_type": "interactive",
             "content": json.dumps(card_content)
         }
-        res = requests.post(url, headers=headers, json=payload)
-        res_data = res.json()
-        if res_data.get("code") != 0:
-            print(f"❌ 飞书群卡片发送失败! 错误: {res_data.get('msg')} | 详情: {res_data}")
-        else:
-            print(f"✅ 飞书群周报卡片发送成功！")
+        requests.post(url, headers=headers, json=payload)
 
 # ===================== Discord 机器人主逻辑 =====================
 class AdvancedBot(discord.Client):
@@ -94,145 +84,125 @@ class AdvancedBot(discord.Client):
     async def on_ready(self):
         print(f"🚀 系统启动，登录身份: {self.user}")
         channel = self.get_channel(CONF["CHANNEL_ID"])
-        if not channel:
-            print("❌ 无法找到指定的频道ID"); await self.close(); return
-
         feishu = FeishuClient()
         genai.configure(api_key=CONF["AI_API_KEY"])
-        # 使用异步模型接口
         ai_model = genai.GenerativeModel(CONF["AI_MODEL"])
         
         start_time, end_time = self.get_range()
         date_display = f"{start_time.strftime('%Y/%m/%d')} - {end_time.strftime('%m/%d')}"
         
-        # 1. 抓取帖子
+        # 1. 获取帖子
         threads = []
         async for t in channel.archived_threads(before=end_time, limit=100):
             if t.created_at >= start_time: threads.append(t)
         for t in channel.threads:
             if start_time <= t.created_at <= end_time: threads.append(t)
 
-        print(f"📊 识别到上周帖子共 {len(threads)} 个，准备批量分析...")
-        
         raw_threads_data = []
         for index, thread in enumerate(threads):
             try:
                 starter_msg = None
-                try:
-                    starter_msg = await thread.fetch_message(thread.id)
-                except:
+                try: starter_msg = await thread.fetch_message(thread.id)
+                except: 
                     async for m in thread.history(limit=1, oldest_first=True): starter_msg = m
                 if not starter_msg: continue
 
                 reaction_count = sum([r.count for r in starter_msg.reactions])
                 unique_users = {starter_msg.author.id}
-                async for msg in thread.history(limit=15): unique_users.add(msg.author.id)
+                async for msg in thread.history(limit=20): unique_users.add(msg.author.id)
 
                 raw_threads_data.append({
-                    "id": index, "标题": thread.name, "内容": starter_msg.content[:500],
+                    "id": index, "标题": thread.name, "内容": starter_msg.content[:600],
                     "热度分": (thread.message_count * 3) + (reaction_count * 1),
-                    "参与人数": len(unique_users),
+                    "参与人数_list": list(unique_users),
                     "帖子链接": f"https://discord.com/channels/{thread.guild.id}/{thread.id}",
                     "日期": int(thread.created_at.timestamp() * 1000)
                 })
-            except Exception as e:
-                print(f"⚠️ 预处理帖子 {thread.name} 失败: {e}")
+            except: continue
 
         if not raw_threads_data:
             print("📭 无有效内容"); await self.close(); return
 
-        # 2. AI 批量分析 (关键修改：使用 generate_content_async)
-        print(f"🤖 正在向 AI 发起批量请求 (包含 {len(raw_threads_data)} 条建议)...")
+        # 2. AI 深度批量分析
+        print(f"🤖 正在调用 AI 进行同类归纳分析...")
         items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_threads_data])
 
         prompt = f"""
-        你是一个游戏社区数据分析师。请分析以下玩家建议。
-        请严格按 JSON 格式输出一个列表 []，每个对象包含：
-        - id: 对应的 ID
-        - sentiment: 情绪打分(1-10)
-        - category: 模块分类(选一：战斗平衡、赛季机制、日常活动、BUG反馈、UI交互)
-        - summary: 一句话建议总结(含“建议”二字)
+        你是一个资深的游戏数据分析师。请分析以下玩家建议清单。
+
+        【分类体系】：
+        1. 战斗平衡：数值、技能、克制。
+        2. 赛季机制：报名、移民/迁徙规则、赛季地图奖励。
+        3. 日常活动：每日任务、常驻活动(僵尸围城、KE、竞技场)。
+        4. 系统优化：代码架构、发热卡顿、性能、PC客户端。
+        5. UI/交互：排版、操作便利性、翻译、红点通知。
+        6. 商业化：礼包、价格、代币、VIP。
+
+        【任务】：
+        严格输出 JSON 列表 []，包含：id, sentiment(1-10), category(一级), sub_category(二级,如:移民门槛), summary(一句话建议总结), topic_label(相同问题的建议必须使用完全相同的話题标签)。
         数据：\n{items_str}
         """
 
-        all_enriched_data = []
         try:
-            # --- 使用 await 和 generate_content_async 防止阻塞心跳 ---
             response = await ai_model.generate_content_async(prompt)
-            
-            json_str = response.text.replace('```json', '').replace('```', '').strip()
-            ai_results = json.loads(json_str)
+            ai_results = json.loads(response.text.replace('```json', '').replace('```', '').strip())
             ai_map = {item['id']: item for item in ai_results}
             
+            all_enriched_data = []
+            topic_groups = {}
+
             for original in raw_threads_data:
-                ai_info = ai_map.get(original['id'], {"sentiment": 5, "category": "未分类", "summary": original['标题']})
-                enriched_item = {
+                ai_info = ai_map.get(original['id'], {"sentiment": 5, "category": "其他", "sub_category": "通用", "summary": original['标题'], "topic_label": original['标题']})
+                
+                item = {
                     **original,
-                    "情绪得分": ai_info.get('sentiment', 5),
-                    "模块分类": ai_info.get('category', '未分类'),
-                    "AI核心总结": ai_info.get('summary', original['标题'])
+                    "模块分类": ai_info.get('category'),
+                    "二级分类": ai_info.get('sub_category'),
+                    "情绪得分": ai_info.get('sentiment'),
+                    "AI核心总结": ai_info.get('summary'),
+                    "话题标签": ai_info.get('topic_label')
                 }
-                all_enriched_data.append(enriched_item)
-                feishu.add_bitable_record(enriched_item)
-                print(f"✅ 已归档: {original['标题']}")
-                # 小技巧：每写一行稍微歇一下，让出心跳时间
-                await asyncio.sleep(0.1) 
+                all_enriched_data.append(item)
+
+                # 话题聚合逻辑
+                label = item["话题标签"]
+                if label not in topic_groups:
+                    topic_groups[label] = {"topic": label, "cat": item["模块分类"], "heat": 0, "count": 0, "users": set(), "sum": item["AI核心总结"]}
+                g = topic_groups[label]
+                g["heat"] += item["热度分"]; g["count"] += 1; g["users"].update(item["参与人数_list"])
+
+            # --- 核心修改：按日期从新到旧排序 ---
+            all_enriched_data.sort(key=lambda x: x['日期'], reverse=True)
+
+            # 3. 批量写入飞书表格
+            feishu.batch_add_bitable_records(all_enriched_data)
+
+            # 4. 推送汇总卡片
+            summary_list = [{"topic": v["topic"], "category": v["cat"], "total_heat": v["heat"], "thread_count": v["count"], "user_count": len(v["users"]), "summary": v["sum"]} for v in topic_groups.values()]
+            await self.send_weekly_card(summary_list, feishu, date_display)
 
         except Exception as e:
-            print(f"❌ AI 分析或归档失败: {e}")
-            for original in raw_threads_data:
-                all_enriched_data.append({**original, "情绪得分": 5, "模块分类": "未分类", "AI核心总结": original['标题']})
-
-        # 4. 推送汇总卡片
-        if all_enriched_data:
-            print("🚀 准备推送飞书周报卡片...")
-            try:
-                await self.send_weekly_card(all_enriched_data, feishu, date_display)
-            except Exception as e:
-                print(f"❌ 飞书卡片推送失败: {e}")
+            print(f"❌ 处理失败: {e}")
         
-        print("🎉 任务圆满完成。")
         await self.close()
 
-    async def send_weekly_card(self, data, feishu_client, date_str):
-        # 排序并取热度前三
-        top_3 = sorted(data, key=lambda x: x.get('热度分', 0), reverse=True)[:3]
-        
-        elements = [
-            {"tag": "markdown", "content": f"**📈 本周社区概览**\n共收集有效建议: {len(data)} 条\n数据已自动归档至多维表格。"},
-            {"tag": "hr"}
-        ]
+    async def send_weekly_card(self, summary_list, feishu_client, date_str):
+        # 话题按总热度排序
+        sorted_topics = sorted(summary_list, key=lambda x: x['total_heat'], reverse=True)[:5]
+        elements = [{"tag": "markdown", "content": f"**📊 上周社区核心话题概览**\n共发现 **{len(summary_list)}** 个讨论主题。"}, {"tag": "hr"}]
 
-        for i, item in enumerate(top_3):
-            sentiment = item.get('情绪得分', 5)
-            color = "🔴" if sentiment <= 3 else "🟡" if sentiment <= 6 else "🟢"
-            summary = item.get('AI核心总结', '无总结')
+        for i, item in enumerate(sorted_topics):
             elements.append({
                 "tag": "markdown",
-                "content": f"{color} **TOP{i+1}: {summary}**\n🔥 热度分: {item.get('热度分', 0)} | 👥 独立参与: {item.get('参与人数', 0)}人"
+                "content": f"**TOP {i+1}: {item['topic']}**\n▫️ 诉求: {item['summary']}\n▫️ 统计: 🔥 热度 {item['total_heat']} | 📑 {item['thread_count']} 篇 | 👥 {item['user_count']} 人讨论\n▫️ 分类: #{item['category']}"
             })
 
-        elements.append({
-            "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🔍 查看多维表格建议库"},
-                "type": "primary",
-                "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
-            }]
-        })
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "📂 查看多维表格明细"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
 
-        card_content = {
-            "config": {"enable_forward": True},
-            "header": {"title": {"tag": "plain_text", "content": f"🗓️ 玩家建议周报 ({date_str})"}, "template": "blue"},
-            "elements": elements
-        }
-        feishu_client.send_group_card(card_content)
+        feishu_client.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 玩家建议周报 ({date_str})"}, "template": "blue"}, "elements": elements})
 
-# ===================== 启动 =====================
 if __name__ == "__main__":
     intents = discord.Intents.default()
-    intents.message_content = True
-    intents.guilds = True
-    bot = AdvancedBot(intents=intents)
-    bot.run(CONF["DISCORD_TOKEN"])
+    intents.message_content, intents.guilds = True, True
+    AdvancedBot(intents=intents).run(CONF["DISCORD_TOKEN"])
