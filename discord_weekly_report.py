@@ -337,15 +337,16 @@ class AdvancedBot(discord.Client):
             score_color = self._sentiment_color(score)
             summary = str(item.get("summary", "")).replace("\n", " ").strip()
             summary = (summary[:88] + "...") if len(summary) > 88 else summary
+            short_summary = (summary[:22] + "...") if len(summary) > 22 else summary
 
             if i == 0:
-                title_md = f"<font color='red'>**TOP 1 · {item['topic']}**</font>"
+                title_md = f"<font color='red'>**TOP 1 · {short_summary or item['topic']}**</font>"
             else:
-                title_md = f"**TOP {i+1} · {item['topic']}**"
+                title_md = f"**TOP {i+1} · {short_summary or item['topic']}**"
 
-            cat_text = str(item.get("category", "")).replace("，", "|").replace(",", "|")
-            cat_list = [c.strip() for c in cat_text.split("|") if c.strip()] or ["未分类"]
-            cat_line = " ".join([f"#{c}" for c in cat_list[:4]])
+            category = str(item.get("category", "未分类")).strip() or "未分类"
+            topic = str(item.get("topic", "未分类")).strip() or "未分类"
+            cat_line = f"#{category}-{topic}"
 
             el.append({
                 "tag": "column_set",
@@ -436,14 +437,16 @@ class AdvancedBot(discord.Client):
             )
         }, {"tag": "hr"}]
         for i, item in enumerate(st):
+            short_summary = str(item.get("summary", "")).replace("\n", " ").strip()
+            short_summary = (short_summary[:22] + "...") if len(short_summary) > 22 else short_summary
             fallback_el.append({
                 "tag": "markdown",
                 "content": (
-                    f"**TOP {i+1}: {item['topic']}**\n"
-                    f"{str(item.get('summary', ''))[:90]}\n"
+                    f"**TOP {i+1}: {short_summary or item['topic']}**\n"
+                    f"{str(item.get('summary', '')).replace('\n', ' ')[:90]}\n"
                     f"🔥 {int(item['total_heat'])} | 🙂 {float(item.get('avg_sentiment', 5.0)):.1f} | "
                     f"📝 {int(item['thread_count'])} | 👥 {int(item['user_count'])} | "
-                    f"#{str(item.get('category', '未分类')).replace('，', '|').replace(',', '|')}"
+                    f"#{str(item.get('category', '未分类')).strip() or '未分类'}-{str(item.get('topic', '未分类')).strip() or '未分类'}"
                 )
             })
         fallback_el.append({"tag": "action", "actions": [{
