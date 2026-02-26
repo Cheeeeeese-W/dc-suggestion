@@ -122,16 +122,35 @@ class AdvancedBot(discord.Client):
         for index, t in enumerate(threads):
             try:
                 msg = None
-                try: msg = await t.fetch_message(t.id)
-                except: 
-                    async for m in t.history(limit=1, oldest_first=True): msg = m
+                # 仅以线程首条消息作为分析对象；如果首条消息已被删除，则忽略该帖子
+                try:
+                    msg = await t.fetch_message(t.id)
+                except:
+                    msg = None
+
                 # 如果首条消息不存在或内容被玩家删除（空内容），则忽略该帖子
                 if not msg or not str(msg.content).strip():
                     continue
+
+                # 统计实际参与人数：按在线程中发过言的唯一玩家 ID 计数（忽略机器人）
+                participants = set()
+                try:
+                    async for m in t.history(limit=None, oldest_first=True):
+                        if getattr(m.author, "bot", False):
+                            continue
+                        participants.add(m.author.id)
+                except:
+                    # 如果遍历历史失败，至少算上首发作者
+                    participants.add(msg.author.id)
+                if not participants:
+                    participants.add(msg.author.id)
+
                 raw_data.append({
                     "id": index, "标题": t.name, "内容": msg.content[:600],
                     "热度分": int((t.message_count * 3) + (sum([r.count for r in msg.reactions]) * 1)),
-                    "owner_id": msg.author.id, "日期": int(t.created_at.timestamp() * 1000),
+                    "owner_id": msg.author.id,
+                    "参与人数": len(participants),
+                    "日期": int(t.created_at.timestamp() * 1000),
                     "帖子链接": f"https://discord.com/channels/{t.guild.id}/{t.id}"
                 })
             except: continue
@@ -221,10 +240,13 @@ class AdvancedBot(discord.Client):
                 if len(c2) > 1 and "通用" in c2: c2.remove("通用")
 
                 all_enriched.append({
-                    **o, "模块分类": c1, "二级分类": c2,
+                    **o,
+                    "模块分类": c1,
+                    "二级分类": c2,
                     "情绪得分": int(ai_info.get('sentiment', 5)),
                     "AI核心总结": str(ai_info.get('summary', o['标题'])),
-                    "参与人数": 1
+                    # 参与人数：优先使用前面 raw_data 中真实统计到的参与人数，兜底为 1
+                    "参与人数": int(o.get("参与人数", 1)) or 1
                 })
         except Exception as e:
             print(f"❌ AI 分析异常: {e}"); await self.close(); return
