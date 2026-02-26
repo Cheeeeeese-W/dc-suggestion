@@ -54,11 +54,11 @@ class FeishuClient:
                 if f.get('模块分类') and f.get('二级分类'):
                     cat1 = f.get('模块分类')
                     cat2 = f.get('二级分类')
-                    # 把“关键字”字段拆成列表；若为空，则默认使用 模块分类 / 二级分类 文本作为关键字，减少维护成本
+                    # 把“关键字”字段拆成列表；若为空，则默认仅使用「二级分类」文本作为关键字，避免模块级别的泛匹配
                     raw_kw = str(f.get('关键字', '')).replace('，', ',')
                     kw_list = [k.strip() for k in raw_kw.split(',') if k.strip()]
                     if not kw_list:
-                        kw_list = [str(cat1).strip(), str(cat2).strip()]
+                        kw_list = [str(cat2).strip()]
                     kb.append({
                         "cat1": cat1,
                         "cat2": cat2,
