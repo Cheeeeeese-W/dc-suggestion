@@ -91,7 +91,6 @@ class AdvancedBot(discord.Client):
         start_time, end_time = self.get_range()
         date_display = f"{start_time.strftime('%Y/%m/%d')} - {end_time.strftime('%m/%d')}"
         
-        # 1. 获取帖子
         threads = []
         async for t in channel.archived_threads(before=end_time, limit=100):
             if t.created_at >= start_time: threads.append(t)
@@ -115,8 +114,8 @@ class AdvancedBot(discord.Client):
                     "id": index, 
                     "标题": thread.name, 
                     "内容": starter_msg.content[:600],
-                    "热度分": (thread.message_count * 3) + (reaction_count * 1),
-                    "参与人数_list": list(unique_users), # 原始列表存这里
+                    "热度分": int((thread.message_count * 3) + (reaction_count * 1)),
+                    "参与人数_list": list(unique_users),
                     "帖子链接": f"https://discord.com/channels/{thread.guild.id}/{thread.id}",
                     "日期": int(thread.created_at.timestamp() * 1000)
                 })
@@ -125,18 +124,12 @@ class AdvancedBot(discord.Client):
         if not raw_threads_data:
             print("📭 无有效内容"); await self.close(); return
 
-        # 2. AI 深度批量分析
         print(f"🤖 正在调用 AI 进行同类归纳分析...")
         items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_threads_data])
 
         prompt = f"""
-        你是一个资深的游戏数据分析师。请分析以下玩家建议清单。
-        讨论同一个具体问题的帖子必须使用完全相同的 topic_label。
-
-        【分类体系】：
-        1. 战斗平衡 | 2. 赛季机制 | 3. 日常活动 | 4. 系统优化 | 5. UI/交互 | 6. 商业化
-        
-        请输出 JSON 列表 []，包含：id, sentiment, category, sub_category, summary, topic_label。
+        你是一个资深的游戏数据分析师。分析建议并输出 JSON 列表 []。
+        包含字段: id, sentiment(数字1-10), category, sub_category, summary, topic_label。
         数据：\n{items_str}
         """
 
@@ -149,23 +142,25 @@ class AdvancedBot(discord.Client):
             topic_groups = {}
 
             for original in raw_threads_data:
-                ai_info = ai_map.get(original['id'], {"sentiment": 5, "category": "其他", "sub_category": "通用", "summary": original['标题'], "topic_label": original['标题']})
+                ai_info = ai_map.get(original['id'], {})
                 
-                # 计算该条记录的参与人数
-                user_count = len(original.get("参与人数_list", []))
+                # --- 强制数字转换逻辑 ---
+                try:
+                    sentiment_val = int(ai_info.get('sentiment', 5))
+                except:
+                    sentiment_val = 5
 
                 item = {
                     **original,
-                    "参与人数": user_count, # 明确赋值为数字
-                    "模块分类": ai_info.get('category'),
-                    "二级分类": ai_info.get('sub_category'),
-                    "情绪得分": ai_info.get('sentiment'),
-                    "AI核心总结": ai_info.get('summary'),
-                    "话题标签": ai_info.get('topic_label')
+                    "参与人数": int(len(original.get("参与人数_list", []))),
+                    "模块分类": str(ai_info.get('category', '其他')),
+                    "二级分类": str(ai_info.get('sub_category', '通用')),
+                    "情绪得分": sentiment_val,
+                    "AI核心总结": str(ai_info.get('summary', original['标题'])),
+                    "话题标签": str(ai_info.get('topic_label', original['标题']))
                 }
                 all_enriched_data.append(item)
 
-                # 话题聚合逻辑（供飞书卡片概览使用）
                 label = item["话题标签"]
                 if label not in topic_groups:
                     topic_groups[label] = {"topic": label, "cat": item["模块分类"], "heat": 0, "count": 0, "users": set(), "sum": item["AI核心总结"]}
@@ -174,13 +169,9 @@ class AdvancedBot(discord.Client):
                 g["count"] += 1
                 g["users"].update(original["参与人数_list"])
 
-            # --- 按日期从新到旧排序 ---
             all_enriched_data.sort(key=lambda x: x['日期'], reverse=True)
-
-            # 3. 批量写入飞书表格
             feishu.batch_add_bitable_records(all_enriched_data)
 
-            # 4. 推送汇总卡片
             summary_list = [{"topic": v["topic"], "category": v["cat"], "total_heat": v["heat"], "thread_count": v["count"], "user_count": len(v["users"]), "summary": v["sum"]} for v in topic_groups.values()]
             await self.send_weekly_card(summary_list, feishu, date_display)
 
