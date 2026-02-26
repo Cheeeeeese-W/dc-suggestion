@@ -125,7 +125,9 @@ class AdvancedBot(discord.Client):
                 try: msg = await t.fetch_message(t.id)
                 except: 
                     async for m in t.history(limit=1, oldest_first=True): msg = m
-                if not msg: continue
+                # 如果首条消息不存在或内容被玩家删除（空内容），则忽略该帖子
+                if not msg or not str(msg.content).strip():
+                    continue
                 raw_data.append({
                     "id": index, "标题": t.name, "内容": msg.content[:600],
                     "热度分": int((t.message_count * 3) + (sum([r.count for r in msg.reactions]) * 1)),
