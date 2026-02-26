@@ -141,81 +141,115 @@ class AdvancedBot(discord.Client):
         if not raw_threads_data:
             print("📭 无有效帖子数据"); await self.close(); return
 
-        # 2. AI 批量聚合分析 (OpenAI 兼容接口)
+        # 2. AI 批量聚合分析 (OpenAI 兼容接口 - 安全增强版)
         print(f"🤖 正在调用 AI 进行同类归纳分析...")
         items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_threads_data])
         tags_str = ", ".join(history_tags) if history_tags else "暂无"
 
         prompt = f"""
-        你是一个专业的游戏策划分析师。请分析玩家建议。
+        你是一个专业的游戏策划分析师。请分析玩家建议并输出 JSON。
         
         【话题命名规范】：
         - 优先从历史参考中选择匹配的标签：[{tags_str}]。
         - 讨论同一个问题的建议必须使用完全相同的 topic_label。
         
-        【分类参考】：
-        - 一级分类：战斗平衡、赛季机制、日常活动、系统优化、UI/交互、商业化。
-        - 二级分类：具体模块名(如：移民门槛)。
+        【分类参考】：一级分类(战斗平衡、赛季机制、日常活动、系统优化、UI/交互、商业化)。
 
-        请严格输出 JSON 列表格式 []，字段包含: id, sentiment(1-10), category, sub_category, summary, topic_label。
+        请严格输出 JSON 列表格式 []，包含字段: id, sentiment, category, sub_category, summary, topic_label。
         数据：\n{items_str}
         """
 
         try:
+            # 发起请求
             response = await ai_client.chat.completions.create(
                 model=CONF["AI_MODEL"],
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": "你是一个只输出 JSON 列表的游戏数据专家。"},
+                    {"role": "user", "content": prompt}
+                ],
                 response_format={"type": "json_object"}
             )
             
-            json_str = response.choices[0].message.content.strip()
-            # 兼容性清理
-            if "```json" in json_str: json_str = json_str.split("```json")[1].split("```")[0].strip()
+            # --- 安全获取结果文本 ---
+            # 情况 1: 标准 OpenAI 对象 (hasattr 检查)
+            if hasattr(response, 'choices'):
+                json_str = response.choices[0].message.content.strip()
+            # 情况 2: 某些中转站返回的是字典
+            elif isinstance(response, dict):
+                json_str = response['choices'][0]['message']['content'].strip()
+            # 情况 3: 报错提到的直接返回了字符串
+            else:
+                json_str = str(response).strip()
+
+            print(f"DEBUG: AI 返回内容摘要: {json_str[:100]}...")
+
+            # 清理 Markdown 标签
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].strip()
             
             ai_results = json.loads(json_str)
-            if isinstance(ai_results, dict): # 适配某些 AI 的包装格式
-                for k in ai_results:
-                    if isinstance(ai_results[k], list): ai_results = ai_results[k]; break
             
+            # 适配嵌套格式：有些 AI 会把列表放在一个 Key 下面
+            if isinstance(ai_results, dict):
+                # 寻找字典里的第一个列表
+                for k in ai_results:
+                    if isinstance(ai_results[k], list):
+                        ai_results = ai_results[k]
+                        break
+            
+            if not isinstance(ai_results, list):
+                raise ValueError("AI 返回的不是有效的列表格式")
+
             ai_map = {item['id']: item for item in ai_results}
             all_enriched_data = []
             topic_groups = {}
             new_tags = set()
 
             for original in raw_threads_data:
-                ai_info = ai_map.get(original['id'], {"sentiment": 5, "category": "其他", "sub_category": "通用", "summary": original['标题'], "topic_label": original['标题']})
+                ai_info = ai_map.get(original['id'], {})
                 
-                label = ai_info.get('topic_label', '未分类话题')
+                label = str(ai_info.get('topic_label', original['标题']))
                 if label not in history_tags: new_tags.add(label)
+
+                # 强制数字转换
+                try: sentiment_val = int(ai_info.get('sentiment', 5))
+                except: sentiment_val = 5
 
                 item = {
                     **original,
-                    "模块分类": str(ai_info.get('category')),
-                    "二级分类": str(ai_info.get('sub_category')),
-                    "情绪得分": int(ai_info.get('sentiment', 5)),
-                    "AI核心总结": str(ai_info.get('summary')),
-                    "参与人数": int(len(original["参与人数_list"])),
+                    "模块分类": str(ai_info.get('category', '其他')),
+                    "二级分类": str(ai_info.get('sub_category', '通用')),
+                    "情绪得分": sentiment_val,
+                    "AI核心总结": str(ai_info.get('summary', original['标题'])),
+                    "参与人数": int(len(original.get("参与人数_list", []))),
                     "话题标签": label
                 }
                 all_enriched_data.append(item)
 
-                # 话题聚合逻辑 (卡片展示)
+                # 聚合逻辑
                 if label not in topic_groups:
                     topic_groups[label] = {"topic": label, "cat": item["模块分类"], "heat": 0, "count": 0, "users": set(), "sum": item["AI核心总结"]}
                 g = topic_groups[label]
-                g["heat"] += item["热度分"]; g["count"] += 1; g["users"].update(original["参与人数_list"])
+                g["heat"] += item["热度分"]
+                g["count"] += 1
+                g["users"].update(original.get("参与人数_list", []))
 
             # --- 排序并写入 ---
             all_enriched_data.sort(key=lambda x: x['日期'], reverse=True)
             feishu.batch_add_bitable_records(all_enriched_data)
             feishu.add_new_tags(list(new_tags))
 
-            # --- 推送概览卡片 ---
+            # --- 推送汇总卡片 ---
             summary_list = [{"topic": v["topic"], "category": v["cat"], "total_heat": v["heat"], "thread_count": v["count"], "user_count": len(v["users"]), "summary": v["sum"]} for v in topic_groups.values()]
             await self.send_weekly_card(summary_list, feishu, date_display)
 
         except Exception as e:
             print(f"❌ 分析或同步失败: {e}")
+            # 打印详细错误信息有助于调试
+            import traceback
+            traceback.print_exc()
         
         await self.close()
 
