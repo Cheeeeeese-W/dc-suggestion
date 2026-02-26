@@ -325,49 +325,11 @@ class AdvancedBot(discord.Client):
         tag_colors = ["blue", "wathet", "turquoise", "green", "lime", "orange", "violet", "indigo"]
 
         el = [{
-            "tag": "column_set",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 4,
-                    "vertical_align": "top",
-                    "elements": [{
-                        "tag": "markdown",
-                        "content": (
-                            "**📊 上周Discord建议热度榜**\n"
-                            f"上周建议数量：**{total_suggestions}**"
-                        )
-                    }]
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 2,
-                    "vertical_align": "top",
-                    "elements": [{
-                        "tag": "div",
-                        "fields": [
-                            {
-                                "is_short": True,
-                                "text": {"tag": "lark_md", "content": "🔥 **热度分**\n`消息数*3 + 反应数*1`"}
-                            },
-                            {
-                                "is_short": True,
-                                "text": {"tag": "lark_md", "content": "🙂 **情绪分**\n`越高越愤怒`"}
-                            }
-                        ]
-                    }]
-                }
-            ]
-        }, {
-            "tag": "note",
-            "elements": [
-                {
-                    "tag": "lark_md",
-                    "content": "统计范围：上周一至周日（UTC）｜数据来源：Discord 建议贴与互动"
-                }
-            ]
+            "tag": "markdown",
+            "content": (
+                "**📊 上周Discord建议热度榜**\n"
+                f"上周建议数量：**{total_suggestions}**"
+            )
         }, {"tag": "hr"}]
 
         for i, item in enumerate(st):
@@ -395,7 +357,7 @@ class AdvancedBot(discord.Client):
                         "vertical_align": "top",
                         "elements": [
                             {"tag": "markdown", "content": title_md},
-                            {"tag": "markdown", "content": f"诉求摘要：{summary}"},
+                            {"tag": "markdown", "content": f"{summary}"},
                             {"tag": "note", "elements": [{"tag": "lark_md", "content": cat_line}]}
                         ]
                     },
@@ -431,7 +393,6 @@ class AdvancedBot(discord.Client):
             if i < len(st) - 1:
                 el.append({"tag": "hr"})
 
-        el.append({"tag": "hr"})
         el.append({
             "tag": "action",
             "actions": [{
@@ -440,6 +401,17 @@ class AdvancedBot(discord.Client):
                 "type": "primary",
                 "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
             }]
+        })
+        el.append({"tag": "hr"})
+        el.append({
+            "tag": "note",
+            "elements": [
+                {"tag": "plain_text", "content": "💡"},
+                {
+                    "tag": "lark_md",
+                    "content": "指标说明：热度 = 消息×3 + 反应×1 ｜ 情绪分越高代表玩家越愤怒。"
+                }
+            ]
         })
         card_payload = {
             "header": {
@@ -460,9 +432,7 @@ class AdvancedBot(discord.Client):
             "tag": "markdown",
             "content": (
                 f"**📊 上周Discord建议热度榜**\n"
-                f"上周建议数量：{total_suggestions}\n"
-                "🔥 热度分 = 帖子消息数 * 3 + 表情反应数 * 1\n"
-                "🙂 情绪分 = AI 对玩家情绪强度评估（越高越愤怒）"
+                f"上周建议数量：{total_suggestions}"
             )
         }, {"tag": "hr"}]
         for i, item in enumerate(st):
@@ -470,7 +440,7 @@ class AdvancedBot(discord.Client):
                 "tag": "markdown",
                 "content": (
                     f"**TOP {i+1}: {item['topic']}**\n"
-                    f"诉求摘要：{str(item.get('summary', ''))[:90]}\n"
+                    f"{str(item.get('summary', ''))[:90]}\n"
                     f"🔥 {int(item['total_heat'])} | 🙂 {float(item.get('avg_sentiment', 5.0)):.1f} | "
                     f"📝 {int(item['thread_count'])} | 👥 {int(item['user_count'])} | "
                     f"#{str(item.get('category', '未分类')).replace('，', '|').replace(',', '|')}"
@@ -482,6 +452,17 @@ class AdvancedBot(discord.Client):
             "type": "primary",
             "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
         }]})
+        fallback_el.append({"tag": "hr"})
+        fallback_el.append({
+            "tag": "note",
+            "elements": [
+                {"tag": "plain_text", "content": "💡"},
+                {
+                    "tag": "lark_md",
+                    "content": "指标说明：热度 = 消息×3 + 反应×1 ｜ 情绪分越高代表玩家越愤怒。"
+                }
+            ]
+        })
         fs.send_group_card({
             "header": {
                 "title": {
