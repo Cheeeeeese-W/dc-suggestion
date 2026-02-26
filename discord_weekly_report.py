@@ -439,11 +439,12 @@ class AdvancedBot(discord.Client):
         for i, item in enumerate(st):
             short_summary = str(item.get("summary", "")).replace("\n", " ").strip()
             short_summary = (short_summary[:22] + "...") if len(short_summary) > 22 else short_summary
+            summary_90 = str(item.get("summary", "")).replace("\n", " ")[:90]
             fallback_el.append({
                 "tag": "markdown",
                 "content": (
                     f"**TOP {i+1}: {short_summary or item['topic']}**\n"
-                    f"{str(item.get('summary', '')).replace('\n', ' ')[:90]}\n"
+                    f"{summary_90}\n"
                     f"🔥 {int(item['total_heat'])} | 🙂 {float(item.get('avg_sentiment', 5.0)):.1f} | "
                     f"📝 {int(item['thread_count'])} | 👥 {int(item['user_count'])} | "
                     f"#{str(item.get('category', '未分类')).strip() or '未分类'}-{str(item.get('topic', '未分类')).strip() or '未分类'}"
