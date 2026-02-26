@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ===================== 配置中心 =====================
+# ===================== 1. 配置中心 =====================
 def get_conf():
     return {
         "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
@@ -27,7 +27,7 @@ def get_conf():
 
 CONF = get_conf()
 
-# ===================== 飞书 API 客户端 =====================
+# ===================== 2. 飞书客户端 =====================
 class FeishuClient:
     def __init__(self):
         self.token = self._get_tenant_access_token()
@@ -40,28 +40,38 @@ class FeishuClient:
         except: return None
 
     def get_reference_pairs(self):
-        """读取参考库：二级分类 + 话题标签"""
         if not self.token: return []
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/records"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
             res = requests.get(url, headers=headers, params={"page_size": 500}, timeout=10)
             items = res.json().get('data', {}).get('items', [])
+            # 兼容性处理列名
             return [{"cat": r['fields'].get('二级分类'), "tag": r['fields'].get('话题标签')} for r in items if r['fields'].get('话题标签')]
         except: return []
 
-    def add_new_reference_pairs(self, new_pairs):
-        """成对同步新分类和标签"""
-        if not self.token or not new_pairs: return
+    def add_new_reference_pairs(self, new_pairs_list):
+        """同步新标签，增加深度报错日志"""
+        if not self.token or not new_pairs_list: return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/records/batch_create"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        records = [{"fields": {"二级分类": str(p[0]), "话题标签": str(p[1])}} for p in new_pairs if p[0] and p[1]]
+        
+        records = []
+        for p in new_pairs_list:
+            if p[0] and p[1]: # 确保分类和标签都不为空
+                records.append({"fields": {"二级分类": str(p[0]), "话题标签": str(p[1])}})
+        
         if not records: return
         res = requests.post(url, headers=headers, json={"records": records}, timeout=10)
-        print(f"📊 历史参考表更新状态: {res.json().get('msg')} (成功写入 {len(records)} 条)")
+        res_data = res.json()
+        
+        if res_data.get("code") == 0:
+            print(f"📊 历史参考表更新成功: 写入 {len(records)} 条新关系")
+        else:
+            print(f"❌ 历史参考表写入失败！错误信息: {res_data.get('msg')}")
+            print(f"❌ 详细错误原因: {res_data.get('error')}") # 这行会打印具体哪个字段错了
 
     def batch_add_bitable_records(self, records_list):
-        """批量写入主数据表"""
         if not self.token or not records_list: return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_create"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
@@ -74,7 +84,7 @@ class FeishuClient:
                 "帖子链接": {"text": "点击查看帖子", "link": r.get("帖子链接")}
             }})
         res = requests.post(url, headers=headers, json={"records": formatted}, timeout=15)
-        print(f"✅ 主表同步状态: {res.json().get('msg')}")
+        print(f"✅ 主表录入状态: {res.json().get('msg')}")
 
     def send_group_card(self, card_content):
         if not self.token: return
@@ -82,7 +92,7 @@ class FeishuClient:
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         payload = {"receive_id": CONF["FEISHU_CHAT_ID"], "msg_type": "interactive", "content": json.dumps(card_content)}
         res = requests.post(url, headers=headers, json=payload, timeout=10)
-        print(f"🚀 飞书卡片推送状态: {res.json().get('msg')}")
+        print(f"🚀 飞书卡片推送: {res.json().get('msg')}")
 
 # ===================== 3. 机器人核心逻辑 =====================
 class AdvancedBot(discord.Client):
@@ -97,10 +107,10 @@ class AdvancedBot(discord.Client):
         feishu = FeishuClient()
         ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=CONF["AI_BASE_URL"].strip().rstrip('/') + '/v1')
         
-        # 1. 读取记忆
+        # 加载参考库
         ref_pairs = feishu.get_reference_pairs()
         print(f"📚 已加载 {len(ref_pairs)} 条历史二级分类-话题对应关系")
-        ref_text = "\n".join([f"- {p['cat']}: {p['tag']}" for p in ref_pairs[:100]]) # 限制参考量防止Token溢出
+        ref_text = "\n".join([f"- {p['cat']}: {p['tag']}" for p in ref_pairs[:50]])
 
         start_time, end_time = self.get_range()
         date_display = f"{start_time.strftime('%Y/%m/%d')} - {end_time.strftime('%m/%d')}"
@@ -111,7 +121,6 @@ class AdvancedBot(discord.Client):
         for t in channel.threads:
             if start_time <= t.created_at <= end_time: threads.append(t)
 
-        print(f"🔍 扫描到上周帖子: {len(threads)} 个")
         raw_data = []
         for index, t in enumerate(threads):
             try:
@@ -131,23 +140,12 @@ class AdvancedBot(discord.Client):
 
         if not raw_data: await self.close(); return
 
-        # 2. AI 分析
-        print(f"🤖 正在调用 AI 进行多维聚合分析...")
-        items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_data])
-        prompt = f"""你是一个资深策划。分析建议并输出 JSON []。
-        
-        【参考记忆（二级分类: 话题标签）】：
-        {ref_text if ref_text else "暂无"}
-
-        【约束】：
-        1. 二级分类(sub_category): 系统模块名词(2-4字)。优先使用参考库。
-        2. 话题标签(topic_label): 具体诉求短语(4-6字)。优先使用参考库。
-        3. 一个建议只给1个最相关的 sub_category 和 topic_label。
-
-        输出字段: id, sentiment(1-10), category(list), sub_category(list), summary, topic_label(list)。
-        数据：\n{items_str}"""
-
         all_enriched, new_ref_pairs = [], set()
+        print(f"🤖 正在调用 AI 进行分析...")
+        items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_data])
+        
+        prompt = f"""分析《DarkWar》反馈。输出 JSON []。参考库：\n{ref_text}\n数据：\n{items_str}"""
+
         try:
             res = await ai_client.chat.completions.create(model=CONF["AI_MODEL"], messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
             js = res.choices[0].message.content.strip()
@@ -161,26 +159,28 @@ class AdvancedBot(discord.Client):
             for o in raw_data:
                 ai_info = ai_map.get(o['id'], {})
                 def to_l(v, d): return [str(i).strip()[:10] for i in (v if isinstance(v, list) else [v] if v else [d])]
-                
                 c1, c2, tp = to_l(ai_info.get('category'), "其他"), to_l(ai_info.get('sub_category'), "通用"), to_l(ai_info.get('topic_label'), o['标题'])
                 
-                # 记录新组合
                 for sub in c2:
                     for tag in tp:
                         if not any(p['cat'] == sub and p['tag'] == tag for p in ref_pairs):
                             new_ref_pairs.add((sub, tag))
-
                 all_enriched.append({**o, "模块分类": c1, "二级分类": c2, "话题标签": tp, "情绪得分": int(ai_info.get('sentiment', 5)), "AI核心总结": str(ai_info.get('summary', o['标题']))})
+        
         except Exception as e:
             print(f"⚠️ AI 降级模式: {e}")
-            for o in raw_data: all_enriched.append({**o, "模块分类": ["未分类"], "二级分类": ["待定"], "话题标签": [o['标题'][:10]], "情绪得分": 5, "AI核心总结": o['标题']})
+            for o in raw_data:
+                tag_label = o['标题'][:15]
+                all_enriched.append({**o, "模块分类": ["未分类"], "二级分类": ["待定"], "话题标签": [tag_label], "情绪得分": 5, "AI核心总结": o['标题']})
+                # 降级模式也将标签存入 new_ref_pairs 供同步
+                new_ref_pairs.add(("待定系统", tag_label))
 
-        # 3. 同步
+        # 3. 数据操作
         all_enriched.sort(key=lambda x: x['日期'], reverse=True)
         feishu.batch_add_bitable_records(all_enriched)
         feishu.add_new_reference_pairs(list(new_ref_pairs))
 
-        # 4. 话题聚合卡片逻辑 (修复重复项)
+        # 4. 卡片推送聚合逻辑
         topic_groups = {}
         for item in all_enriched:
             for label in item["话题标签"]:
@@ -192,25 +192,24 @@ class AdvancedBot(discord.Client):
                 g["users"].add(item["owner_id"])
 
         summary_list = []
-        seen_summaries = set() # 最终汇总去重
+        seen_topics = set()
         sorted_keys = sorted(topic_groups.keys(), key=lambda k: topic_groups[k]['heat'], reverse=True)
-        
         for k in sorted_keys:
             v = topic_groups[k]
-            if v['sum'] not in seen_summaries:
+            if v['topic'] not in seen_topics:
                 summary_list.append({"topic": v["topic"], "category": v["cat"], "total_heat": v["heat"], "thread_count": v["count"], "user_count": len(v["users"]), "summary": v["sum"]})
-                seen_summaries.add(v['sum'])
+                seen_topics.add(v['topic'])
 
         if summary_list: await self.send_weekly_card(summary_list, feishu, date_display)
         await self.close()
 
     async def send_weekly_card(self, sl, fs, dt):
-        st = sl[:5] # 取排完序后的前5
+        st = sl[:5]
         el = [{"tag": "markdown", "content": f"**📊 上周社区核心话题概览**\n共识别主题: {len(sl)} 个"}, {"tag": "hr"}]
         for i, item in enumerate(st):
-            el.append({"tag": "markdown", "content": f"**TOP {i+1}: {item['topic']}**\n诉求: {item['summary']}\n🔥 热度 {item['total_heat']} | 📑 {item['thread_count']} 篇 | 👥 {item['user_count']} 人提及 | #{item['category']}"})
+            el.append({"tag": "markdown", "content": f"**TOP {i+1}: {item['topic']}**\n诉求: {item['summary'][:100]}\n🔥 热度 {item['total_heat']} | 📑 {item['thread_count']} 篇 | 👥 {item['user_count']} 人提及 | #{item['category']}"})
         el.append({"tag": "hr"})
-        el.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "🔍 查看明细记录"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
+        el.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
         fs.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 玩家建议周报 ({dt})"}, "template": "blue"}, "elements": el})
 
 if __name__ == "__main__":
