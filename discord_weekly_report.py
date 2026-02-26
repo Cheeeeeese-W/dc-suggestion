@@ -11,7 +11,6 @@ load_dotenv()
 
 # ===================== 1. 配置中心 =====================
 def get_conf():
-    # 统一环境变量命名，确保与 GitHub Secret 一致
     return {
         "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
         "CHANNEL_ID": int(os.getenv("DISCORD_CHANNEL_ID")),
@@ -22,7 +21,7 @@ def get_conf():
         "FEISHU_APP_SECRET": os.getenv("FEISHU_APP_SECRET"),
         "BITABLE_TOKEN": os.getenv("FEISHU_BITABLE_APP_TOKEN"),
         "BITABLE_TABLE_ID": os.getenv("FEISHU_BITABLE_TABLE_ID"),
-        "REFERENCE_TABLE_ID": os.getenv("FEISHU_REFERENCE_TABLE_ID"), # 修正了这里
+        "FEISHU_REFERENCE_TABLE_ID": os.getenv("FEISHU_REFERENCE_TABLE_ID"),
         "FEISHU_CHAT_ID": os.getenv("FEISHU_CHAT_ID")
     }
 
@@ -35,45 +34,30 @@ class FeishuClient:
 
     def _get_tenant_access_token(self):
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-        try:
-            res = requests.post(url, json={"app_id": CONF["FEISHU_APP_ID"], "app_secret": CONF["FEISHU_APP_SECRET"]}, timeout=10)
-            return res.json().get("tenant_access_token")
-        except: return None
+        res = requests.post(url, json={"app_id": CONF["FEISHU_APP_ID"], "app_secret": CONF["FEISHU_APP_SECRET"]}, timeout=10)
+        return res.json().get("tenant_access_token")
 
     def get_reference_pairs(self):
-        if not self.token or not CONF['REFERENCE_TABLE_ID']: 
-            print(f"⚠️ 跳过读取参考表: ID 为 {CONF['REFERENCE_TABLE_ID']}")
-            return []
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/records"
+        ref_id = CONF.get('FEISHU_REFERENCE_TABLE_ID')
+        if not self.token or not ref_id: return []
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{ref_id}/records"
         headers = {"Authorization": f"Bearer {self.token}"}
-        try:
-            res = requests.get(url, headers=headers, params={"page_size": 500}, timeout=10)
-            items = res.json().get('data', {}).get('items', [])
-            return [{"cat": r['fields'].get('二级分类'), "tag": r['fields'].get('话题标签')} for r in items if r['fields'].get('话题标签')]
-        except: return []
+        res = requests.get(url, headers=headers, params={"page_size": 500}, timeout=10)
+        items = res.json().get('data', {}).get('items', [])
+        return [{"cat": r['fields'].get('二级分类'), "tag": r['fields'].get('话题标签')} for r in items if r['fields'].get('话题标签')]
 
     def add_new_reference_pairs(self, new_pairs_list):
-        if not self.token or not CONF['REFERENCE_TABLE_ID'] or not new_pairs_list: return
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/records/batch_create"
-        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        
-        records = []
-        for p in new_pairs_list:
-            if p[0] and p[1]:
-                records.append({"fields": {"二级分类": str(p[0]), "话题标签": str(p[1])}})
-        
-        if not records: return
-        res = requests.post(url, headers=headers, json={"records": records}, timeout=10)
-        res_data = res.json()
-        if res_data.get("code") == 0:
-            print(f"📊 历史参考表更新成功: 写入 {len(records)} 条")
-        else:
-            print(f"❌ 历史参考表写入失败: {res_data.get('msg')} | 表ID: {CONF['REFERENCE_TABLE_ID']}")
+        ref_id = CONF.get('FEISHU_REFERENCE_TABLE_ID')
+        if not self.token or not ref_id or not new_pairs_list: return
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{ref_id}/records/batch_create"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        records = [{"fields": {"二级分类": str(p[0]), "话题标签": str(p[1])}} for p in new_pairs_list if p[0] and p[1]]
+        requests.post(url, headers=headers, json={"records": records}, timeout=10)
 
     def batch_add_bitable_records(self, records_list):
         if not self.token or not records_list: return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_create"
-        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {self.token}"}
         formatted = [{"fields": {
             "日期": r.get("日期"), "模块分类": r.get("模块分类"), "二级分类": r.get("二级分类"),
             "话题标签": r.get("话题标签"), "热度分": int(r.get("热度分", 0)), "参与人数": int(r.get("参与人数", 0)),
@@ -86,10 +70,9 @@ class FeishuClient:
     def send_group_card(self, card_content):
         if not self.token: return
         url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
-        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {self.token}"}
         payload = {"receive_id": CONF["FEISHU_CHAT_ID"], "msg_type": "interactive", "content": json.dumps(card_content)}
-        res = requests.post(url, headers=headers, json=payload, timeout=10)
-        print(f"🚀 飞书卡片推送: {res.json().get('msg')}")
+        requests.post(url, headers=headers, json=payload, timeout=10)
 
 # ===================== 3. 机器人核心逻辑 =====================
 class AdvancedBot(discord.Client):
@@ -100,19 +83,19 @@ class AdvancedBot(discord.Client):
 
     async def on_ready(self):
         print(f"🚀 系统就绪: {self.user}")
-        print(f"DEBUG: 正在使用参考表 ID: {CONF['REFERENCE_TABLE_ID']}")
-        
         channel = self.get_channel(CONF["CHANNEL_ID"])
         feishu = FeishuClient()
-        ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=CONF["AI_BASE_URL"].strip().rstrip('/') + '/v1')
         
+        # 修正 Base URL
+        base_url = CONF["AI_BASE_URL"].strip().rstrip('/') + '/v1'
+        ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=base_url)
+        
+        # 1. 读取参考库
         ref_pairs = feishu.get_reference_pairs()
-        print(f"📚 已加载 {len(ref_pairs)} 条历史参考关系")
+        print(f"📚 已成功加载历史参考标签数量: {len(ref_pairs)}")
         ref_text = "\n".join([f"- {p['cat']}: {p['tag']}" for p in ref_pairs[:50]])
 
         start_time, end_time = self.get_range()
-        date_display = f"{start_time.strftime('%Y/%m/%d')} - {end_time.strftime('%m/%d')}"
-        
         threads = []
         async for t in channel.archived_threads(before=end_time, limit=100):
             if t.created_at >= start_time: threads.append(t)
@@ -130,93 +113,107 @@ class AdvancedBot(discord.Client):
                 raw_data.append({
                     "id": index, "标题": t.name, "内容": msg.content[:500],
                     "热度分": int((t.message_count * 3) + (sum([r.count for r in msg.reactions]) * 1)),
-                    "owner_id": msg.author.id, "参与人数": 1,
+                    "owner_id": msg.author.id,
                     "帖子链接": f"https://discord.com/channels/{t.guild.id}/{t.id}",
                     "日期": int(t.created_at.timestamp() * 1000)
                 })
             except: continue
 
-        if not raw_data: await self.close(); return
+        if not raw_data:
+            print("📭 上周无有效帖子"); await self.close(); return
 
-        all_enriched, new_ref_pairs = [], set()
-        print(f"🤖 正在调用 AI 进行分析...")
+        # ---------------- 核心 AI 处理区 (无 Try-Except 拦截错误) ----------------
+        print(f"🤖 正在发起 AI 批量分析请求...")
         items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_data])
         
-        prompt = f"""分析《DarkWar》反馈。输出 JSON []。参考库：\n{ref_text}\n数据：\n{items_str}"""
-
-        try:
-            res = await ai_client.chat.completions.create(model=CONF["AI_MODEL"], messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
-            js = res.choices[0].message.content.strip()
-            if "```json" in js: js = js.split("```json")[1].split("```")[0].strip()
-            ai_res = json.loads(js)
-            if isinstance(ai_res, dict):
-                for k in ai_res:
-                    if isinstance(ai_res[k], list): ai_res = ai_res[k]; break
-            
-            ai_map = {item['id']: item for item in ai_res if isinstance(item, dict)}
-            for o in raw_data:
-                ai_info = ai_map.get(o['id'], {})
-                def to_l(v, d): return [str(i).strip()[:10] for i in (v if isinstance(v, list) else [v] if v else [d])]
-                c1, c2, tp = to_l(ai_info.get('category'), "其他"), to_l(ai_info.get('sub_category'), "通用"), to_l(ai_info.get('topic_label'), o['标题'])
-                
-                # 情绪得分安全性转换
-                sent = ai_info.get('sentiment', 5)
-                try: sentiment_val = int(sent)
-                except: sentiment_val = 5
-
-                for sub in c2:
-                    for tag in tp:
-                        if not any(p['cat'] == sub and p['tag'] == tag for p in ref_pairs):
-                            new_ref_pairs.add((sub, tag))
-                all_enriched.append({**o, "模块分类": c1, "二级分类": c2, "话题标签": tp, "情绪得分": sentiment_val, "AI核心总结": str(ai_info.get('summary', o['标题']))})
+        prompt = f"""你是一个专业的游戏策划。请分析以下《DarkWar》玩家建议。
         
-        except Exception as e:
-            print(f"⚠️ AI 异常进入降级: {e}")
-            for o in raw_data:
-                # 降级模式下也通过“标题前10个字”来进行去重
-                tag_label = o['标题'][:15].strip()
-                all_enriched.append({**o, "模块分类": ["未分类"], "二级分类": ["待定"], "话题标签": [tag_label], "情绪得分": 5, "AI核心总结": o['标题']})
-                if not any(p['tag'] == tag_label for p in ref_pairs):
-                    new_ref_pairs.add(("待定系统", tag_label))
+        【任务要求】：
+        1. 必须将总结(summary)翻译为中文。
+        2. 话题标签(topic_label)优先从历史记忆库中匹配。
+        3. 严格输出 JSON 格式。
 
-        # 3. 同步
+        【参考记忆（二级分类: 话题标签）】：
+        {ref_text if ref_text else "暂无"}
+
+        输出字段: id, sentiment(1-10数字), category(list), sub_category(list), summary(中文总结), topic_label(list)。
+        数据：\n{items_str}"""
+
+        # 获取 AI 响应 (直接运行，如果报错 GitHub Actions 会捕获堆栈)
+        res = await ai_client.chat.completions.create(
+            model=CONF["AI_MODEL"], 
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        
+        js_raw = res.choices[0].message.content.strip()
+        print(f"DEBUG: AI 原始返回内容 -> {js_raw[:200]}...") # 打印开头部分用于调试
+
+        # 解析 JSON
+        if "```json" in js_raw: js_raw = js_raw.split("```json")[1].split("```")[0].strip()
+        ai_res = json.loads(js_raw)
+        if isinstance(ai_res, dict):
+            for k in ai_res:
+                if isinstance(ai_res[k], list): ai_res = ai_res[k]; break
+        
+        ai_map = {item['id']: item for item in ai_res if isinstance(item, dict)}
+        
+        all_enriched, new_ref_pairs = [], set()
+        for o in raw_data:
+            ai_info = ai_map.get(o['id'], {})
+            
+            # 安全提取
+            def to_l(v, d): return [str(i).strip()[:15] for i in (v if isinstance(v, list) else [v] if v else [d])]
+            sent = 5
+            try: sent = int(ai_info.get('sentiment', 5))
+            except: pass
+
+            c1 = to_l(ai_info.get('category'), "其他")
+            c2 = to_l(ai_info.get('sub_category'), "通用")
+            tp = to_l(ai_info.get('topic_label'), o['标题'])
+
+            # 记录新对
+            for sub in c2:
+                for tag in tp:
+                    if not any(p['cat'] == sub and p['tag'] == tag for p in ref_pairs):
+                        new_ref_pairs.add((sub, tag))
+
+            all_enriched.append({
+                **o, "模块分类": c1, "二级分类": c2, "话题标签": tp,
+                "情绪得分": sent, "AI核心总结": str(ai_info.get('summary', o['标题'])), "参与人数": 1
+            })
+
+        # ---------------- 录入与推送 ----------------
         all_enriched.sort(key=lambda x: x['日期'], reverse=True)
         feishu.batch_add_bitable_records(all_enriched)
         feishu.add_new_reference_pairs(list(new_ref_pairs))
 
-        # 4. 汇总卡片逻辑 (深度去重)
+        # 聚合推送
         topic_groups = {}
         for item in all_enriched:
             for label in item["话题标签"]:
                 if label not in topic_groups:
                     topic_groups[label] = {"topic": label, "cat": item["模块分类"][0], "heat": 0, "count": 0, "users": set(), "sum": item["AI核心总结"]}
                 g = topic_groups[label]
-                g["heat"] += item["热度分"]
-                g["count"] += 1
-                g["users"].add(item["owner_id"])
+                g["heat"] += item["热度分"]; g["count"] += 1; g["users"].add(item["owner_id"])
 
         summary_list = []
-        seen_topics = set()
-        sorted_keys = sorted(topic_groups.keys(), key=lambda k: topic_groups[k]['heat'], reverse=True)
-        for k in sorted_keys:
+        seen_summaries = set()
+        for k in sorted(topic_groups.keys(), key=lambda x: topic_groups[x]['heat'], reverse=True):
             v = topic_groups[k]
-            # 强化去重：如果话题名完全一样，或者总结内容前20个字一样，则合并
-            summary_sig = v['sum'][:20].strip()
-            if v['topic'] not in seen_topics and summary_sig:
-                summary_list.append({"topic": v["topic"], "category": v["cat"], "total_heat": v["heat"], "thread_count": v["count"], "user_count": len(v["users"]), "summary": v["sum"]})
-                seen_topics.add(v['topic'])
+            if v['sum'][:20] not in seen_summaries:
+                summary_list.append(v); seen_summaries.add(v['sum'][:20])
 
-        if summary_list: await self.send_weekly_card(summary_list, feishu, date_display)
+        if summary_list:
+            st = summary_list[:5]
+            el = [{"tag": "markdown", "content": f"**📊 上周社区话题概览**\n共识别主题: {len(summary_list)} 个"}, {"tag": "hr"}]
+            for i, item in enumerate(st):
+                el.append({"tag": "markdown", "content": f"**TOP {i+1}: {item['topic']}**\n诉求: {item['sum'][:150]}\n🔥 热度 {item['heat']} | 📑 {item['count']} 篇 | 👥 {len(item['users'])} 人提及 | #{item['cat']}"})
+            el.append({"tag": "hr"})
+            el.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
+            feishu.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 玩家建议周报 ({start_time.strftime('%m/%d')}-{end_time.strftime('%m/%d')})"}, "template": "blue"}, "elements": el})
+        
         await self.close()
-
-    async def send_weekly_card(self, sl, fs, dt):
-        st = sl[:5]
-        el = [{"tag": "markdown", "content": f"**📊 上周社区核心话题概览**\n共识别主题: {len(sl)} 个"}, {"tag": "hr"}]
-        for i, item in enumerate(st):
-            el.append({"tag": "markdown", "content": f"**TOP {i+1}: {item['topic']}**\n诉求: {item['summary'][:120]}\n🔥 热度 {item['total_heat']} | 📑 {item['thread_count']} 篇 | 👥 {item['user_count']} 人提及 | #{item['category']}"})
-        el.append({"tag": "hr"})
-        el.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
-        fs.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 玩家建议周报 ({dt})"}, "template": "blue"}, "elements": el})
 
 if __name__ == "__main__":
     intents = discord.Intents.default()
