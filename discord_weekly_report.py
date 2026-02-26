@@ -180,6 +180,7 @@ class AdvancedBot(discord.Client):
         1. 输出必须为简体中文。
         2. 如果建议涉及多个系统，category 和 sub_category 请使用列表。
         3. summary 必须是对建议的一句话精炼总结。
+        4. sentiment 为 1-10 分，分数越高代表玩家越愤怒（10 最愤怒，1 最平和）。
 
         输出字段: id, sentiment(1-10), category(list), sub_category(list), summary(中文)。
         数据：\n{items_str}"""
@@ -295,29 +296,157 @@ class AdvancedBot(discord.Client):
         
         await self.close()
 
+    def _sentiment_color(self, score):
+        if score >= 8.0:
+            return "red"
+        if score >= 5.0:
+            return "orange"
+        return "green"
+
+    def _template_by_sentiment(self, score):
+        if score >= 8.0:
+            return "red"
+        if score >= 5.0:
+            return "orange"
+        return "green"
+
     async def send_weekly_card(self, st, fs, start_dt, total_suggestions):
+        top_sentiment = float(st[0]["avg_sentiment"]) if st else 5.0
+        tag_colors = ["blue", "wathet", "turquoise", "green", "lime", "orange", "violet", "indigo"]
+
         el = [{
-            "tag": "markdown",
-            "content": (
-                "**📊 上周Discord建议热度榜**\n"
-                f"上周建议数量：{total_suggestions}\n"
-                "🔥 热度分 = 帖子消息数 * 3 + 表情反应数 * 1\n"
-                "🙂 情绪分 = AI 对玩家情绪强度的评估，分数越低越愤怒。"
-            )
+            "tag": "column_set",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 4,
+                    "vertical_align": "top",
+                    "elements": [{
+                        "tag": "markdown",
+                        "content": (
+                            "**📊 上周Discord建议热度榜**\n"
+                            f"上周建议数量：**{total_suggestions}**"
+                        )
+                    }]
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 2,
+                    "vertical_align": "top",
+                    "elements": [{
+                        "tag": "div",
+                        "fields": [
+                            {
+                                "is_short": True,
+                                "text": {"tag": "lark_md", "content": "🔥 **热度分**\n`消息数*3 + 反应数*1`"}
+                            },
+                            {
+                                "is_short": True,
+                                "text": {"tag": "lark_md", "content": "🙂 **情绪分**\n`越高越愤怒`"}
+                            }
+                        ]
+                    }]
+                }
+            ]
+        }, {
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "lark_md",
+                    "content": "统计范围：上周一至周日（UTC）｜数据来源：Discord 建议贴与互动"
+                }
+            ]
         }, {"tag": "hr"}]
+
         for i, item in enumerate(st):
+            score = float(item.get("avg_sentiment", 5.0))
+            score_color = self._sentiment_color(score)
+            summary = str(item.get("summary", "")).replace("\n", " ").strip()
+            summary = (summary[:88] + "...") if len(summary) > 88 else summary
+
+            if i == 0:
+                title_md = f"<font color='red'>**TOP 1 · {item['topic']}**</font>"
+            else:
+                title_md = f"**TOP {i+1} · {item['topic']}**"
+
+            cat_text = str(item.get("category", "")).replace("，", "|").replace(",", "|")
+            cat_list = [c.strip() for c in cat_text.split("|") if c.strip()] or ["未分类"]
+            cat_tags = []
+            for idx, cat in enumerate(cat_list[:4]):
+                cat_tags.append({
+                    "tag": "tag",
+                    "text": {"tag": "plain_text", "content": f"#{cat}"},
+                    "color": tag_colors[idx % len(tag_colors)]
+                })
+
             el.append({
-                "tag": "markdown",
-                "content": (
-                    f"**TOP {i+1}: {item['topic']}**\n"
-                    f"诉求摘要: {item['summary'][:100]}\n"
-                    f"🔥 总热度 {item['total_heat']} | 🙂 情绪分 {item['avg_sentiment']} | "
-                    f"📑 {item['thread_count']} 篇建议 | 👥 {item['user_count']} 人关注 | #{item['category']}"
-                )
+                "tag": "column_set",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 4,
+                        "vertical_align": "top",
+                        "elements": [
+                            {"tag": "markdown", "content": title_md},
+                            {"tag": "markdown", "content": f"诉求摘要：{summary}"},
+                            {"tag": "note", "elements": cat_tags}
+                        ]
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 2,
+                        "vertical_align": "top",
+                        "elements": [{
+                            "tag": "div",
+                            "fields": [
+                                {
+                                    "is_short": True,
+                                    "text": {"tag": "lark_md", "content": f"🔥 **总热度**\n{int(item['total_heat'])}"}
+                                },
+                                {
+                                    "is_short": True,
+                                    "text": {"tag": "lark_md", "content": f"🙂 **情绪分**\n<font color='{score_color}'>{score:.1f}</font>"}
+                                },
+                                {
+                                    "is_short": True,
+                                    "text": {"tag": "lark_md", "content": f"📝 **建议数**\n{int(item['thread_count'])}"}
+                                },
+                                {
+                                    "is_short": True,
+                                    "text": {"tag": "lark_md", "content": f"👥 **关注数**\n{int(item['user_count'])}"}
+                                }
+                            ]
+                        }]
+                    }
+                ]
             })
+            if i < len(st) - 1:
+                el.append({"tag": "hr"})
+
         el.append({"tag": "hr"})
-        el.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
-        fs.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 上周Discord建议热度榜 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"}, "template": "blue"}, "elements": el})
+        el.append({
+            "tag": "action",
+            "actions": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"},
+                "type": "primary",
+                "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
+            }]
+        })
+        fs.send_group_card({
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"🗓️ 上周Discord建议热度榜 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"
+                },
+                "template": self._template_by_sentiment(top_sentiment)
+            },
+            "elements": el
+        })
 
 if __name__ == "__main__":
     intents = discord.Intents.default()
