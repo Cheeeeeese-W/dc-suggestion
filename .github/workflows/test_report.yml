@@ -18,10 +18,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install discord.py google-generativeai requests python-dotenv
+        run: pip install discord.py openai requests python-dotenv
+
 
       - name: Run Script
         env:
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
