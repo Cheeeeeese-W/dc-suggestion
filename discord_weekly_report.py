@@ -299,8 +299,9 @@ class AdvancedBot(discord.Client):
         el = [{
             "tag": "markdown",
             "content": (
-                "**📊 上周社区二级分类热度榜**\n"
-                "热度分 = 帖子消息量与互动反应的综合分；情绪分 = AI 对建议情绪强度的 1-10 分评估。"
+                "**📊 上周Discord建议热度榜**\n"
+                "🔥 热度分 = 帖子消息数 * 3 + 表情反应数 * 1\n"
+                "🙂 情绪分 = AI 对玩家情绪强度的评估，分数越低越愤怒。"
             )
         }, {"tag": "hr"}]
         for i, item in enumerate(st):
@@ -315,7 +316,7 @@ class AdvancedBot(discord.Client):
             })
         el.append({"tag": "hr"})
         el.append({"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"}, "type": "primary", "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"}]})
-        fs.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 玩家建议周报 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"}, "template": "blue"}, "elements": el})
+        fs.send_group_card({"header": {"title": {"tag": "plain_text", "content": f"🗓️ 上周Discord建议热度榜 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"}, "template": "blue"}, "elements": el})
 
 if __name__ == "__main__":
     intents = discord.Intents.default()
