@@ -36,29 +36,29 @@ class FeishuClient:
         return res.json().get("tenant_access_token")
 
     def batch_add_bitable_records(self, records_list):
-        """批量写入记录，效率更高"""
+        """批量写入记录到多维表格"""
         if not self.token or not records_list: return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_create"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         
         formatted_records = []
-        for fields in records_list:
+        for item in records_list:
             formatted_records.append({
                 "fields": {
-                    "日期": fields.get("日期"),
-                    "模块分类": fields.get("模块分类"),
-                    "二级分类": fields.get("二级分类"),
-                    "热度分": fields.get("热度分"),
-                    "参与人数": fields.get("参与人数"),
-                    "AI核心总结": fields.get("AI核心总结"),
-                    "情绪得分": fields.get("情绪得分"),
-                    "帖子链接": {"text": "点击查看帖子", "link": fields.get("帖子链接")}
+                    "日期": item.get("日期"),
+                    "模块分类": item.get("模块分类"),
+                    "二级分类": item.get("二级分类"),
+                    "热度分": item.get("热度分"),
+                    "参与人数": item.get("参与人数"), # 这里现在是数字了
+                    "AI核心总结": item.get("AI核心总结"),
+                    "情绪得分": item.get("情绪得分"),
+                    "帖子链接": {"text": "点击查看帖子", "link": item.get("帖子链接")}
                 }
             })
         
         res = requests.post(url, headers=headers, json={"records": formatted_records})
         if res.json().get("code") == 0:
-            print(f"✅ 成功批量同步 {len(records_list)} 条记录到多维表格")
+            print(f"✅ 成功同步 {len(records_list)} 条记录到多维表格")
         else:
             print(f"❌ 多维表格同步失败: {res.text}")
 
@@ -112,9 +112,11 @@ class AdvancedBot(discord.Client):
                 async for msg in thread.history(limit=20): unique_users.add(msg.author.id)
 
                 raw_threads_data.append({
-                    "id": index, "标题": thread.name, "内容": starter_msg.content[:600],
+                    "id": index, 
+                    "标题": thread.name, 
+                    "内容": starter_msg.content[:600],
                     "热度分": (thread.message_count * 3) + (reaction_count * 1),
-                    "参与人数_list": list(unique_users),
+                    "参与人数_list": list(unique_users), # 原始列表存这里
                     "帖子链接": f"https://discord.com/channels/{thread.guild.id}/{thread.id}",
                     "日期": int(thread.created_at.timestamp() * 1000)
                 })
@@ -129,17 +131,12 @@ class AdvancedBot(discord.Client):
 
         prompt = f"""
         你是一个资深的游戏数据分析师。请分析以下玩家建议清单。
+        讨论同一个具体问题的帖子必须使用完全相同的 topic_label。
 
         【分类体系】：
-        1. 战斗平衡：数值、技能、克制。
-        2. 赛季机制：报名、移民/迁徙规则、赛季地图奖励。
-        3. 日常活动：每日任务、常驻活动(僵尸围城、KE、竞技场)。
-        4. 系统优化：代码架构、发热卡顿、性能、PC客户端。
-        5. UI/交互：排版、操作便利性、翻译、红点通知。
-        6. 商业化：礼包、价格、代币、VIP。
-
-        【任务】：
-        严格输出 JSON 列表 []，包含：id, sentiment(1-10), category(一级), sub_category(二级,如:移民门槛), summary(一句话建议总结), topic_label(相同问题的建议必须使用完全相同的話题标签)。
+        1. 战斗平衡 | 2. 赛季机制 | 3. 日常活动 | 4. 系统优化 | 5. UI/交互 | 6. 商业化
+        
+        请输出 JSON 列表 []，包含：id, sentiment, category, sub_category, summary, topic_label。
         数据：\n{items_str}
         """
 
@@ -154,8 +151,12 @@ class AdvancedBot(discord.Client):
             for original in raw_threads_data:
                 ai_info = ai_map.get(original['id'], {"sentiment": 5, "category": "其他", "sub_category": "通用", "summary": original['标题'], "topic_label": original['标题']})
                 
+                # 计算该条记录的参与人数
+                user_count = len(original.get("参与人数_list", []))
+
                 item = {
                     **original,
+                    "参与人数": user_count, # 明确赋值为数字
                     "模块分类": ai_info.get('category'),
                     "二级分类": ai_info.get('sub_category'),
                     "情绪得分": ai_info.get('sentiment'),
@@ -164,14 +165,16 @@ class AdvancedBot(discord.Client):
                 }
                 all_enriched_data.append(item)
 
-                # 话题聚合逻辑
+                # 话题聚合逻辑（供飞书卡片概览使用）
                 label = item["话题标签"]
                 if label not in topic_groups:
                     topic_groups[label] = {"topic": label, "cat": item["模块分类"], "heat": 0, "count": 0, "users": set(), "sum": item["AI核心总结"]}
                 g = topic_groups[label]
-                g["heat"] += item["热度分"]; g["count"] += 1; g["users"].update(item["参与人数_list"])
+                g["heat"] += item["热度分"]
+                g["count"] += 1
+                g["users"].update(original["参与人数_list"])
 
-            # --- 核心修改：按日期从新到旧排序 ---
+            # --- 按日期从新到旧排序 ---
             all_enriched_data.sort(key=lambda x: x['日期'], reverse=True)
 
             # 3. 批量写入飞书表格
@@ -187,7 +190,6 @@ class AdvancedBot(discord.Client):
         await self.close()
 
     async def send_weekly_card(self, summary_list, feishu_client, date_str):
-        # 话题按总热度排序
         sorted_topics = sorted(summary_list, key=lambda x: x['total_heat'], reverse=True)[:5]
         elements = [{"tag": "markdown", "content": f"**📊 上周社区核心话题概览**\n共发现 **{len(summary_list)}** 个讨论主题。"}, {"tag": "hr"}]
 
