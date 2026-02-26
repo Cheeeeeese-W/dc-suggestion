@@ -188,12 +188,12 @@ class AdvancedBot(discord.Client):
 
         【要求】：
         1. 输出必须为简体中文。
-        2. 如果建议涉及多个系统，category 和 sub_category 请使用列表。
+        2. category 和 sub_category 只输出单个最合适的分类（不要列表）。
         3. summary 必须是对建议的一句话精炼总结。
         4. short_title 必须是 10 字以内的中文短标题，用于卡片展示。
         5. sentiment 为 1-10 分，分数越高代表玩家越愤怒（10 最愤怒，1 最平和）。
 
-        输出字段: id, sentiment(1-10), category(list), sub_category(list), short_title(10字以内), summary(中文)。
+        输出字段: id, sentiment(1-10), category(单个字符串), sub_category(单个字符串), short_title(10字以内), summary(中文)。
         数据：\n{items_str}"""
 
         all_enriched, new_kb_records = [], set()
@@ -211,13 +211,15 @@ class AdvancedBot(discord.Client):
             for o in raw_data:
                 ai_info = ai_map.get(o['id'], {})
                 
-                # 将各种输入统一为「字符串列表」，便于后续处理，d 为默认值
+                # 将输入统一为「字符串列表」，便于兼容 AI 偶发返回 list/字符串
                 def to_l(v, d):
-                    return [str(i).strip()[:15] for i in (v if isinstance(v, list) else [v] if v else [d])]
+                    return [str(i).strip()[:20] for i in (v if isinstance(v, list) else [v] if v else [d])]
 
-                # 1）AI 原始分类结果（只作为兜底 & 关键字匹配的“标签源”）
+                # AI 原始分类结果（兜底）
                 ai_c1 = to_l(ai_info.get('category'), "其他")
                 ai_c2 = to_l(ai_info.get('sub_category'), "通用")
+                ai_cat1 = ai_c1[0]
+                ai_cat2 = ai_c2[0]
 
                 # 2）只用「AI 的分类文本 + 总结」做关键字匹配，不直接用玩家原始文本，避免误伤
                 label_text = (
@@ -226,37 +228,36 @@ class AdvancedBot(discord.Client):
                     str(ai_info.get("summary", ""))
                 ).upper()
 
-                # 3）基于飞书参考表关键字，将 AI 的各种说法统一到标准分类（允许多模块多二级）
-                matched_pairs = set()  # (cat1, cat2)
+                # 3）单选策略：按“匹配得分”选一个最合适的标准标签
+                pair_scores = {}  # {(cat1, cat2): score}
                 for entry in kb:
+                    pair = (entry['cat1'], entry['cat2'])
+                    score = 0
                     for kw in entry['keywords']:
                         kw = (kw or "").strip()
                         if not kw:
                             continue
                         if kw.upper() in label_text:
-                            matched_pairs.add((entry['cat1'], entry['cat2']))
+                            # 关键字命中是主权重
+                            score += 3
+                    # AI 与参考库字段一致时给额外分，帮助从多个命中中挑最贴切
+                    if entry['cat1'] in ai_c1:
+                        score += 2
+                    if entry['cat2'] in ai_c2:
+                        score += 4
+                    if score > 0:
+                        pair_scores[pair] = pair_scores.get(pair, 0) + score
 
-                if matched_pairs:
-                    # 命中了参考表：完全采用标准分类（支持多个模块多个二级）
-                    c1 = [p[0] for p in matched_pairs]
-                    c2 = [p[1] for p in matched_pairs]
+                if pair_scores:
+                    # 选得分最高的单个标签；并列时按字典序稳定选择
+                    best_pair = sorted(pair_scores.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))[0][0]
+                    c1, c2 = best_pair[0], best_pair[1]
                 else:
-                    # 没命中任何关键字：退回 AI 自己的分类结果
-                    c1, c2 = ai_c1, ai_c2
-
-                    # 同时识别 AI 新产出的分类组合，如果在参考表不存在则准备写入（关键字留空）
-                    for i in range(len(c1)):
-                        cat1_val = c1[i]
-                        cat2_val = c2[i] if i < len(c2) else c2[0]
-                        # 跳过占位默认值
-                        if cat1_val in ("其他", "", None) or cat2_val in ("通用", "", None):
-                            continue
-                        if not any(e['cat1'] == cat1_val and e['cat2'] == cat2_val for e in kb):
-                            new_kb_records.add((cat1_val, cat2_val))
-
-                # 如果分类里包含了初始的“其他”或“通用”且有新分类进来了，把默认值删掉
-                if len(c1) > 1 and "其他" in c1: c1.remove("其他")
-                if len(c2) > 1 and "通用" in c2: c2.remove("通用")
+                    # 没命中参考库：用 AI 单选结果，并自动补录新组合
+                    c1, c2 = ai_cat1, ai_cat2
+                    if c1 not in ("其他", "", None) and c2 not in ("通用", "", None):
+                        if not any(e['cat1'] == c1 and e['cat2'] == c2 for e in kb):
+                            new_kb_records.add((c1, c2))
 
                 all_enriched.append({
                     **o,
@@ -279,24 +280,29 @@ class AdvancedBot(discord.Client):
         # 4. 话题聚合卡片逻辑 (现在基于“二级分类”聚合)
         cat_groups = {}
         for item in all_enriched:
-            for sub_cat in item["二级分类"]:
-                if sub_cat not in cat_groups:
-                    cat_groups[sub_cat] = {
-                        "name": sub_cat, "cat1": item["模块分类"][0],
-                        "heat": 0, "count": 0, "user_count": 0,
-                        "sentiment_total": 0,
-                        "summary": item["AI核心总结"],
-                        "short_title": item.get("AI短标题", item["AI核心总结"]),
-                        "cat1_set": set(item.get("模块分类", []) or [item["模块分类"][0]])
-                    }
-                g = cat_groups[sub_cat]
-                g["heat"] += item["热度分"]
-                g["count"] += 1
-                g["user_count"] += int(item.get("参与人数", 1)) or 1
-                g["sentiment_total"] += int(item.get("情绪得分", 5))
-                for cat1 in item.get("模块分类", []):
-                    if str(cat1).strip():
-                        g["cat1_set"].add(str(cat1).strip())
+            sub_cat = str(item.get("二级分类", "通用")).strip() or "通用"
+            item_heat = int(item.get("热度分", 0))
+            item_sentiment = int(item.get("情绪得分", 5))
+            if sub_cat not in cat_groups:
+                cat_groups[sub_cat] = {
+                    "name": sub_cat, "cat1": str(item.get("模块分类", "其他")).strip() or "其他",
+                    "heat": 0, "count": 0, "user_count": 0,
+                    "sentiment_total": 0,
+                    "summary": item["AI核心总结"],
+                    "short_title": item.get("AI短标题", item["AI核心总结"]),
+                    # 代表建议：优先热度，其次情绪，用于卡片标题与概述
+                    "best_rank": (item_heat, item_sentiment)
+                }
+            g = cat_groups[sub_cat]
+            g["heat"] += item["热度分"]
+            g["count"] += 1
+            g["user_count"] += int(item.get("参与人数", 1)) or 1
+            g["sentiment_total"] += int(item.get("情绪得分", 5))
+            current_rank = (item_heat, item_sentiment)
+            if current_rank > g.get("best_rank", (-1, -1)):
+                g["best_rank"] = current_rank
+                g["summary"] = item["AI核心总结"]
+                g["short_title"] = item.get("AI短标题", item["AI核心总结"])
 
         summary_list = []
         for v in cat_groups.values():
@@ -305,7 +311,7 @@ class AdvancedBot(discord.Client):
                 "total_heat": v["heat"], "thread_count": v["count"],
                 "user_count": v["user_count"], "summary": v["summary"],
                 "short_title": v.get("short_title", v["summary"]),
-                "tag_list": [f"{cat}-{v['name']}" for cat in sorted(v.get("cat1_set", {v['cat1']}))],
+                "tag_list": [f"{v['cat1']}-{v['name']}"],
                 "avg_sentiment": round(v["sentiment_total"] / v["count"], 1) if v["count"] else 5.0
             })
 
@@ -332,7 +338,6 @@ class AdvancedBot(discord.Client):
 
     async def send_weekly_card(self, st, fs, start_dt, total_suggestions):
         top_sentiment = float(st[0]["avg_sentiment"]) if st else 5.0
-        tag_colors = ["blue", "wathet", "turquoise", "green", "lime", "orange", "violet", "indigo"]
 
         el = [{
             "tag": "markdown",
