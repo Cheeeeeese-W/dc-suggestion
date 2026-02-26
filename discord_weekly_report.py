@@ -99,7 +99,17 @@ class FeishuClient:
         url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         payload = {"receive_id": CONF["FEISHU_CHAT_ID"], "msg_type": "interactive", "content": json.dumps(card_content)}
-        requests.post(url, headers=headers, json=payload, timeout=10)
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=10)
+            data = res.json()
+            if data.get("code") != 0:
+                print(f"❌ 飞书卡片发送失败: code={data.get('code')} msg={data.get('msg')}")
+                return False
+            print("✅ 飞书卡片发送成功")
+            return True
+        except Exception as e:
+            print(f"❌ 飞书卡片发送异常: {e}")
+            return False
 
 # ===================== 3. 机器人核心逻辑 =====================
 class AdvancedBot(discord.Client):
@@ -373,13 +383,7 @@ class AdvancedBot(discord.Client):
 
             cat_text = str(item.get("category", "")).replace("，", "|").replace(",", "|")
             cat_list = [c.strip() for c in cat_text.split("|") if c.strip()] or ["未分类"]
-            cat_tags = []
-            for idx, cat in enumerate(cat_list[:4]):
-                cat_tags.append({
-                    "tag": "tag",
-                    "text": {"tag": "plain_text", "content": f"#{cat}"},
-                    "color": tag_colors[idx % len(tag_colors)]
-                })
+            cat_line = " ".join([f"#{c}" for c in cat_list[:4]])
 
             el.append({
                 "tag": "column_set",
@@ -392,7 +396,7 @@ class AdvancedBot(discord.Client):
                         "elements": [
                             {"tag": "markdown", "content": title_md},
                             {"tag": "markdown", "content": f"诉求摘要：{summary}"},
-                            {"tag": "note", "elements": cat_tags}
+                            {"tag": "note", "elements": [{"tag": "lark_md", "content": cat_line}]}
                         ]
                     },
                     {
@@ -437,7 +441,7 @@ class AdvancedBot(discord.Client):
                 "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
             }]
         })
-        fs.send_group_card({
+        card_payload = {
             "header": {
                 "title": {
                     "tag": "plain_text",
@@ -446,6 +450,47 @@ class AdvancedBot(discord.Client):
                 "template": self._template_by_sentiment(top_sentiment)
             },
             "elements": el
+        }
+        ok = fs.send_group_card(card_payload)
+        if ok:
+            return
+
+        # 复杂布局不兼容时降级为简版卡片，保证消息可达
+        fallback_el = [{
+            "tag": "markdown",
+            "content": (
+                f"**📊 上周Discord建议热度榜**\n"
+                f"上周建议数量：{total_suggestions}\n"
+                "🔥 热度分 = 帖子消息数 * 3 + 表情反应数 * 1\n"
+                "🙂 情绪分 = AI 对玩家情绪强度评估（越高越愤怒）"
+            )
+        }, {"tag": "hr"}]
+        for i, item in enumerate(st):
+            fallback_el.append({
+                "tag": "markdown",
+                "content": (
+                    f"**TOP {i+1}: {item['topic']}**\n"
+                    f"诉求摘要：{str(item.get('summary', ''))[:90]}\n"
+                    f"🔥 {int(item['total_heat'])} | 🙂 {float(item.get('avg_sentiment', 5.0)):.1f} | "
+                    f"📝 {int(item['thread_count'])} | 👥 {int(item['user_count'])} | "
+                    f"#{str(item.get('category', '未分类')).replace('，', '|').replace(',', '|')}"
+                )
+            })
+        fallback_el.append({"tag": "action", "actions": [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"},
+            "type": "primary",
+            "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
+        }]})
+        fs.send_group_card({
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"🗓️ 上周Discord建议热度榜 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"
+                },
+                "template": "blue"
+            },
+            "elements": fallback_el
         })
 
 if __name__ == "__main__":
