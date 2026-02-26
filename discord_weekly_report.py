@@ -171,29 +171,52 @@ class AdvancedBot(discord.Client):
             for o in raw_data:
                 ai_info = ai_map.get(o['id'], {})
                 
-                # 初始分类获取
-                def to_l(v, d): return [str(i).strip()[:15] for i in (v if isinstance(v, list) else [v] if v else [d])]
-                c1, c2 = to_l(ai_info.get('category'), "其他"), to_l(ai_info.get('sub_category'), "通用")
-                
-                # --- 核心：基于飞书参考表的关键字硬核纠偏 ---
-                combined_text = (o['标题'] + o['内容']).upper()
+                # 将各种输入统一为「字符串列表」，便于后续处理，d 为默认值
+                def to_l(v, d):
+                    return [str(i).strip()[:15] for i in (v if isinstance(v, list) else [v] if v else [d])]
+
+                # 1）AI 原始分类结果（只作为兜底 & 关键字匹配的“标签源”）
+                ai_c1 = to_l(ai_info.get('category'), "其他")
+                ai_c2 = to_l(ai_info.get('sub_category'), "通用")
+
+                # 2）只用「AI 的分类文本 + 总结」做关键字匹配，不直接用玩家原始文本，避免误伤
+                label_text = (
+                    " ".join(ai_c1) + " " +
+                    " ".join(ai_c2) + " " +
+                    str(ai_info.get("summary", ""))
+                ).upper()
+
+                # 3）基于飞书参考表关键字，将 AI 的各种说法统一到标准分类（允许多模块多二级）
+                matched_pairs = set()  # (cat1, cat2)
                 for entry in kb:
                     for kw in entry['keywords']:
-                        if kw.strip() and kw.strip().upper() in combined_text:
-                            # 匹配成功，覆盖 AI 的分类（支持多关键字匹配多个分类）
-                            if entry['cat1'] not in c1: c1.append(entry['cat1'])
-                            if entry['cat2'] not in c2: c2.append(entry['cat2'])
-                
+                        kw = (kw or "").strip()
+                        if not kw:
+                            continue
+                        if kw.upper() in label_text:
+                            matched_pairs.add((entry['cat1'], entry['cat2']))
+
+                if matched_pairs:
+                    # 命中了参考表：完全采用标准分类（支持多个模块多个二级）
+                    c1 = [p[0] for p in matched_pairs]
+                    c2 = [p[1] for p in matched_pairs]
+                else:
+                    # 没命中任何关键字：退回 AI 自己的分类结果
+                    c1, c2 = ai_c1, ai_c2
+
+                    # 同时识别 AI 新产出的分类组合，如果在参考表不存在则准备写入（关键字留空）
+                    for i in range(len(c1)):
+                        cat1_val = c1[i]
+                        cat2_val = c2[i] if i < len(c2) else c2[0]
+                        # 跳过占位默认值
+                        if cat1_val in ("其他", "", None) or cat2_val in ("通用", "", None):
+                            continue
+                        if not any(e['cat1'] == cat1_val and e['cat2'] == cat2_val for e in kb):
+                            new_kb_records.add((cat1_val, cat2_val))
+
                 # 如果分类里包含了初始的“其他”或“通用”且有新分类进来了，把默认值删掉
                 if len(c1) > 1 and "其他" in c1: c1.remove("其他")
                 if len(c2) > 1 and "通用" in c2: c2.remove("通用")
-
-                # 检查是否是全新分类组合，准备入库
-                for i in range(len(c1)):
-                    cat1_val = c1[i]
-                    cat2_val = c2[i] if i < len(c2) else c2[0]
-                    if not any(e['cat1'] == cat1_val and e['cat2'] == cat2_val for e in kb):
-                        new_kb_records.add((cat1_val, cat2_val))
 
                 all_enriched.append({
                     **o, "模块分类": c1, "二级分类": c2,
