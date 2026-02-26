@@ -291,15 +291,16 @@ class AdvancedBot(discord.Client):
         if summary_list:
             # 卡片按总热度分排序
             summary_list.sort(key=lambda x: x['total_heat'], reverse=True)
-            await self.send_weekly_card(summary_list[:5], feishu, start_time)
+            await self.send_weekly_card(summary_list[:5], feishu, start_time, len(all_enriched))
         
         await self.close()
 
-    async def send_weekly_card(self, st, fs, start_dt):
+    async def send_weekly_card(self, st, fs, start_dt, total_suggestions):
         el = [{
             "tag": "markdown",
             "content": (
                 "**📊 上周Discord建议热度榜**\n"
+                f"上周建议数量：{total_suggestions}\n"
                 "🔥 热度分 = 帖子消息数 * 3 + 表情反应数 * 1\n"
                 "🙂 情绪分 = AI 对玩家情绪强度的评估，分数越低越愤怒。"
             )
