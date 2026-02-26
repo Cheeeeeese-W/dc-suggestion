@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ===================== 配置中心 =====================
+# ===================== 1. 配置中心 =====================
 def get_conf():
     return {
         "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
@@ -27,7 +27,7 @@ def get_conf():
 
 CONF = get_conf()
 
-# ===================== 飞书客户端 =====================
+# ===================== 2. 飞书客户端 =====================
 class FeishuClient:
     def __init__(self):
         self.token = self._get_tenant_access_token()
@@ -50,44 +50,36 @@ class FeishuClient:
         except: return []
 
     def add_new_reference_pairs(self, new_pairs_list):
-        """同步新标签，包含详细错误侦察"""
         if not self.token or not new_pairs_list: return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/records/batch_create"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        
-        records = []
-        for p in new_pairs_list:
-            if p[0] and p[1]:
-                # 强制清理：确保字段名对应你的飞书参考表列名
-                records.append({"fields": {"二级分类": str(p[0]), "话题标签": str(p[1])}})
-        
+        records = [{"fields": {"二级分类": str(p[0]), "话题标签": str(p[1])}} for p in new_pairs_list if p[0] and p[1]]
         if not records: return
         res = requests.post(url, headers=headers, json={"records": records}, timeout=10)
         res_data = res.json()
-        
         if res_data.get("code") == 0:
-            print(f"📊 历史参考表成功更新: 写入 {len(records)} 条")
+            print(f"📊 历史参考表录入成功: 写入 {len(records)} 条")
         else:
             print(f"❌ 历史参考表写入失败: {res_data.get('msg')}")
-            # 调试雷达：获取该表的所有字段名，帮助用户比对
-            print(f"🔍 正在检索参考表字段名以定位问题...")
+            # 自动诊断
             meta_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/fields"
             meta_res = requests.get(meta_url, headers=headers)
-            field_names = [f.get('field_name') for f in meta_res.json().get('data', {}).get('items', [])]
-            print(f"💡 参考表里真实的列名是: {field_names}")
+            fields = [f.get('field_name') for f in meta_res.json().get('data', {}).get('items', [])]
+            if not fields:
+                print(f"‼️ 警告：参考表 ID [{CONF['REFERENCE_TABLE_ID']}] 似乎无效或无列，请核对是否填成了 ViewID")
+            else:
+                print(f"💡 参考表列名为: {fields}，请检查是否包含 '二级分类' 和 '话题标签'")
 
     def batch_add_bitable_records(self, records_list):
         if not self.token or not records_list: return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_create"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        formatted = []
-        for r in records_list:
-            formatted.append({"fields": {
-                "日期": r.get("日期"), "模块分类": r.get("模块分类"), "二级分类": r.get("二级分类"),
-                "话题标签": r.get("话题标签"), "热度分": int(r.get("热度分", 0)), "参与人数": int(r.get("参与人数", 0)),
-                "AI核心总结": str(r.get("AI核心总结", "")), "情绪得分": int(r.get("情绪得分", 5)),
-                "帖子链接": {"text": "点击查看帖子", "link": r.get("帖子链接")}
-            }})
+        formatted = [{"fields": {
+            "日期": r.get("日期"), "模块分类": r.get("模块分类"), "二级分类": r.get("二级分类"),
+            "话题标签": r.get("话题标签"), "热度分": int(r.get("热度分", 0)), "参与人数": int(r.get("参与人数", 0)),
+            "AI核心总结": str(r.get("AI核心总结", "")), "情绪得分": int(r.get("情绪得分", 5)),
+            "帖子链接": {"text": "点击查看帖子", "link": r.get("帖子链接")}
+        }} for r in records_list]
         res = requests.post(url, headers=headers, json={"records": formatted}, timeout=15)
         print(f"✅ 主表录入状态: {res.json().get('msg')}")
 
@@ -99,7 +91,7 @@ class FeishuClient:
         res = requests.post(url, headers=headers, json=payload, timeout=10)
         print(f"🚀 飞书卡片推送: {res.json().get('msg')}")
 
-# ===================== 机器人核心逻辑 =====================
+# ===================== 3. 机器人核心逻辑 =====================
 class AdvancedBot(discord.Client):
     def get_range(self):
         now = datetime.now(timezone.utc)
@@ -134,7 +126,7 @@ class AdvancedBot(discord.Client):
                     async for m in t.history(limit=1, oldest_first=True): msg = m
                 if not msg: continue
                 raw_data.append({
-                    "id": index, "标题": t.name, "内容": msg.content[:500],
+                    "id": index, "thread_id": t.id, "标题": t.name, "内容": msg.content[:500],
                     "热度分": int((t.message_count * 3) + (sum([r.count for r in msg.reactions]) * 1)),
                     "owner_id": msg.author.id, "参与人数": 1,
                     "帖子链接": f"https://discord.com/channels/{t.guild.id}/{t.id}",
@@ -145,9 +137,14 @@ class AdvancedBot(discord.Client):
         if not raw_data: await self.close(); return
 
         all_enriched, new_ref_pairs = [], set()
-        print(f"🤖 正在调用 AI 分析...")
+        print(f"🤖 正在调用 AI 进行多维聚合分析...")
         items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_data])
-        prompt = f"""分析反馈并输出 JSON []。参考记忆：\n{ref_text}\n数据：\n{items_str}"""
+        
+        prompt = f"""分析《DarkWar》反馈。输出 JSON []。
+        【规则】：
+        1. 每个建议严格只给 1 个 sub_category 和 1 个 topic_label。
+        2. 话题标签必须是具体的痛点短语(4-6字)。
+        3. 优先匹配库：\n{ref_text}\n数据：\n{items_str}"""
 
         try:
             res = await ai_client.chat.completions.create(model=CONF["AI_MODEL"], messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
@@ -162,53 +159,57 @@ class AdvancedBot(discord.Client):
             for o in raw_data:
                 ai_info = ai_map.get(o['id'], {})
                 
-                # 情绪得分安全性转换 (修复 'Neutral' 问题)
+                # 情绪纠偏
                 sent = ai_info.get('sentiment', 5)
-                try: 
-                    sentiment_val = int(sent)
-                except: 
-                    sentiment_val = 5 # 如果是文字（如 Neutral）则给中间值
+                try: sentiment_val = int(sent)
+                except: sentiment_val = 5
 
-                def to_l(v, d): return [str(i).strip()[:10] for i in (v if isinstance(v, list) else [v] if v else [d])]
-                c1, c2, tp = to_l(ai_info.get('category'), "其他"), to_l(ai_info.get('sub_category'), "通用"), to_l(ai_info.get('topic_label'), o['标题'])
+                # 强制单选逻辑
+                def to_single_l(v, d):
+                    res = v[0] if isinstance(v, list) and v else v if v else d
+                    return [str(res).strip()[:15]]
+
+                c1 = to_single_l(ai_info.get('category'), "其他")
+                c2 = to_single_l(ai_info.get('sub_category'), "通用")
+                tp = to_single_l(ai_info.get('topic_label'), o['标题'])
                 
-                for sub in c2:
-                    for tag in tp:
-                        if not any(p['cat'] == sub and p['tag'] == tag for p in ref_pairs):
-                            new_ref_pairs.add((sub, tag))
+                # 记录新组合
+                cat_str, tag_str = c2[0], tp[0]
+                if not any(p['cat'] == cat_str and p['tag'] == tag_str for p in ref_pairs):
+                    new_ref_pairs.add((cat_str, tag_str))
+
                 all_enriched.append({**o, "模块分类": c1, "二级分类": c2, "话题标签": tp, "情绪得分": sentiment_val, "AI核心总结": str(ai_info.get('summary', o['标题']))})
         
         except Exception as e:
-            print(f"⚠️ AI 降级模式: {e}")
-            for o in raw_data:
-                tag_label = o['标题'][:15]
-                all_enriched.append({**o, "模块分类": ["未分类"], "二级分类": ["待定"], "话题标签": [tag_label], "情绪得分": 5, "AI核心总结": o['标题']})
-                if not any(p['tag'] == tag_label for p in ref_pairs):
-                    new_ref_pairs.add(("待定系统", tag_label))
+            print(f"⚠️ AI 分析环节异常: {e}，跳过同步。")
+            await self.close(); return
 
-        # 3. 排序与同步
+        # 3. 同步
         all_enriched.sort(key=lambda x: x['日期'], reverse=True)
         feishu.batch_add_bitable_records(all_enriched)
         feishu.add_new_reference_pairs(list(new_ref_pairs))
 
-        # 4. 汇总卡片逻辑
+        # 4. 汇总卡片逻辑（基于 Summary 去重，防止同一个帖子出现多次）
         topic_groups = {}
         for item in all_enriched:
-            for label in item["话题标签"]:
-                if label not in topic_groups:
-                    topic_groups[label] = {"topic": label, "cat": item["模块分类"][0], "heat": 0, "count": 0, "users": set(), "sum": item["AI核心总结"]}
-                g = topic_groups[label]
-                g["heat"] += item["热度分"]; g["count"] += 1; g["users"].add(item["owner_id"])
+            label = item["话题标签"][0]
+            if label not in topic_groups:
+                topic_groups[label] = {"topic": label, "cat": item["模块分类"][0], "heat": 0, "count": 0, "users": set(), "sum": item["AI核心总结"]}
+            g = topic_groups[label]
+            g["heat"] += item["热度分"]
+            g["count"] += 1
+            g["users"].add(item["owner_id"])
 
         summary_list = []
         seen_summaries = set()
         sorted_keys = sorted(topic_groups.keys(), key=lambda k: topic_groups[k]['heat'], reverse=True)
         for k in sorted_keys:
             v = topic_groups[k]
-            # 强化总结去重，防止降级模式下重复显示
-            if v['sum'][:30] not in seen_summaries:
+            # 核心去重：如果总结内容前20个字一样，视为重复
+            summary_fingerprint = v['sum'][:20].strip()
+            if summary_fingerprint not in seen_summaries:
                 summary_list.append({"topic": v["topic"], "category": v["cat"], "total_heat": v["heat"], "thread_count": v["count"], "user_count": len(v["users"]), "summary": v["sum"]})
-                seen_summaries.add(v['sum'][:30])
+                seen_summaries.add(summary_fingerprint)
 
         if summary_list: await self.send_weekly_card(summary_list, feishu, date_display)
         await self.close()
