@@ -57,28 +57,28 @@ jobs:
               "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/test_report.yml/runs?event=schedule&branch=$DEFAULT_BRANCH&per_page=50")"
 
             count_10am="$(RUNS_JSON="$runs_json" python - <<'PY'
-import datetime as dt
-import json
-import os
+          import datetime as dt
+          import json
+          import os
 
-data = json.loads(os.environ.get("RUNS_JSON", "{}"))
-today = dt.datetime.now(dt.timezone.utc).date()
-cur_id = str(os.environ.get("GITHUB_RUN_ID", ""))
+          data = json.loads(os.environ.get("RUNS_JSON", "{}"))
+          today = dt.datetime.now(dt.timezone.utc).date()
+          cur_id = str(os.environ.get("GITHUB_RUN_ID", ""))
 
-count = 0
-for run in data.get("workflow_runs", []):
-    if str(run.get("id")) == cur_id:
-        continue
-    created = run.get("created_at")
-    if not created:
-        continue
-    t = dt.datetime.fromisoformat(created.replace("Z", "+00:00"))
-    # 仅统计“今天 UTC 2点整触发窗口”的 schedule 记录，避免把 10:30 自己算进去
-    if t.date() == today and t.hour == 2 and t.minute < 20:
-        count += 1
-print(count)
-PY
-)"
+          count = 0
+          for run in data.get("workflow_runs", []):
+              if str(run.get("id")) == cur_id:
+                  continue
+              created = run.get("created_at")
+              if not created:
+                  continue
+              t = dt.datetime.fromisoformat(created.replace("Z", "+00:00"))
+              # 仅统计“今天 UTC 2点整触发窗口”的 schedule 记录，避免把 10:30 自己算进去
+              if t.date() == today and t.hour == 2 and t.minute < 20:
+                  count += 1
+          print(count)
+          PY
+          )"
 
             if [ "$count_10am" -gt 0 ]; then
               echo "10:00 的 schedule 已有执行记录，本次 10:30 跳过补跑。"
