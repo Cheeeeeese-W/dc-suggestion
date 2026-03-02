@@ -135,6 +135,37 @@ class AdvancedBot(discord.Client):
         this_mon = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         return this_mon - timedelta(days=7), this_mon - timedelta(seconds=1)
 
+    def _reaction_polarity_counts(self, msg):
+        """
+        统计首帖反应的正负向数量：
+        - 正向：赞 / 100分 / UP
+        - 负向：踩
+        """
+        positive = 0
+        negative = 0
+        for r in (getattr(msg, "reactions", None) or []):
+            cnt = int(getattr(r, "count", 0) or 0)
+            emoji_raw = str(getattr(r, "emoji", "")).lower()
+            emoji_name = str(getattr(getattr(r, "emoji", None), "name", "")).lower()
+            token = f"{emoji_raw} {emoji_name}"
+
+            # 负向：踩
+            if ("👎" in token) or ("thumbsdown" in token) or ("thumb_down" in token) or ("downvote" in token) or ("-1" in token):
+                negative += cnt
+                continue
+
+            # 正向：赞 / 100分 / UP
+            if ("👍" in token) or ("thumbsup" in token) or ("thumb_up" in token) or ("upvote" in token) or ("+1" in token):
+                positive += cnt
+                continue
+            if ("💯" in token) or (":100:" in token) or ("100" == emoji_name):
+                positive += cnt
+                continue
+            if ("up" == emoji_name) or ("_up" in emoji_name) or ("up_" in emoji_name):
+                positive += cnt
+                continue
+        return positive, negative
+
     async def on_ready(self):
         print(f"🚀 系统就绪: {self.user}")
         channel = self.get_channel(CONF["CHANNEL_ID"])
@@ -164,6 +195,12 @@ class AdvancedBot(discord.Client):
 
                 # 如果首条消息不存在或内容被玩家删除（空内容），则忽略该帖子
                 if not msg or not str(msg.content).strip():
+                    continue
+
+                # 表情倾向过滤：负向（踩）占主导则忽略该帖子
+                pos_count, neg_count = self._reaction_polarity_counts(msg)
+                if neg_count > pos_count:
+                    print(f"⏭️ 忽略（负向主导）: {t.name} | 正向={pos_count}, 负向={neg_count}")
                     continue
 
                 # 统计实际参与人数：按在线程中发过言的唯一玩家 ID 计数（忽略机器人）
