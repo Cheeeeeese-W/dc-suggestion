@@ -12,8 +12,8 @@ on:
           - test
           - prod
   schedule:
-    - cron: '0 2 * * 1' # 每周一北京时间上午 10:00 (UTC 2:00) 正常执行
-    - cron: '30 2 * * 1' # 每周一北京时间上午 10:30 (UTC 2:30) 补偿检查
+    - cron: '0 2 * * 5' # 每周五北京时间上午 10:00 (UTC 2:00) 正常执行
+    - cron: '30 2 * * 5' # 每周五北京时间上午 10:30 (UTC 2:30) 补偿检查
 
 permissions:
   contents: read
@@ -49,7 +49,7 @@ jobs:
           should_run=true
 
           # 10:00 正常任务始终执行；只在 10:30 做“是否需要补跑”的判断
-          if [ "$TRIGGER_CRON" = "30 2 * * 1" ]; then
+          if [ "$TRIGGER_CRON" = "30 2 * * 5" ]; then
             today="$(date -u +%Y-%m-%d)"
             runs_json="$(curl -sS \
               -H "Authorization: Bearer $GH_TOKEN" \
