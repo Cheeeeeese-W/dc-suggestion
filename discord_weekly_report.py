@@ -448,6 +448,7 @@ class DailyBot(discord.Client):
                 max_tokens=1000,
             )
             text = res.choices[0].message.content.strip()
+            print(f"🤖 AI 预筛原始输出 (前500字): {text[:500]}")
             passed = set()
             for line in text.split("\n"):
                 parts = line.strip().split("|")
@@ -456,6 +457,13 @@ class DailyBot(discord.Client):
                     decision = parts[1].strip().lower()
                     if "yes" in decision:
                         passed.add(tid)
+                else:
+                    # 尝试宽松匹配：整行包含 yes/no
+                    lower_line = line.lower()
+                    for t_item in thread_list:
+                        if str(t_item["thread_id"]) in lower_line and "yes" in lower_line:
+                            passed.add(str(t_item["thread_id"]))
+            print(f"🤖 解析后通过: {len(passed)} 个 (输入{len(thread_list)} 个)")
             return passed
         except Exception as e:
             print(f"⚠️ AI 预筛异常: {e}")
