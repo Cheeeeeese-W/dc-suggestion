@@ -636,9 +636,9 @@ class DailyBot(discord.Client):
                 #   sentiment, prev_sentiment, reply_count, prev_reply_count,
                 #   participant_count, prev_participant_count,
                 #   heat_score, heat_trend, silent_days, hot_flag, filtered, record_id)
-                old_reply_count = existing[16]  # reply_count
+                old_reply_count = existing[16] or 0  # reply_count
                 old_sentiment = existing[13]     # sentiment
-                old_silent_days = existing[21]   # silent_days
+                old_silent_days = existing[21] or 0   # silent_days
 
                 # 保存旧值用于后续计算
                 t["prev_reply_count"] = old_reply_count
