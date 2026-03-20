@@ -401,10 +401,10 @@ class DailyBot(discord.Client):
     # ---- 第一层：规则过滤 ----
     def _rule_filter(self, thread_data: dict) -> bool:
         """返回 True = 通过过滤"""
-        # 回复数 < 2
-        if thread_data.get("reply_count", 0) < 2:
+        # 回复数 < 1（完全没人回的帖子跳过）
+        if thread_data.get("reply_count", 0) < 1:
             return False
-        # 参与人数 < 2
+        # 参与人数 < 2（至少 OP + 1人）
         if thread_data.get("participant_count", 0) < 2:
             return False
         # 首帖内容 < 10 字符
@@ -433,14 +433,14 @@ class DailyBot(discord.Client):
             content_preview = t.get("first_content", "")[:100]
             lines.append(f"[{t['thread_id']}] {t['title']} | {content_preview}")
         prompt = (
-            "你是 DarkWar 游戏的社区分析师。判断以下帖子是否值得策划团队关注。\n"
-            "放行标准（满足任一即 yes）：\n"
-            "- 玩家直接反馈问题/建议/bug\n"
-            "- 玩家对游戏机制、平衡性、赛季的讨论或吐槽\n"
-            "- 玩家情绪强烈（不满/兴奋/失望）\n"
-            "- 回复数多或参与人数多的热门讨论\n"
-            "排除（no）：纯水帖、纯表情、无意义内容、与游戏无关闲聊。\n"
-            "宁可多放行，不要漏掉有价值的讨论。\n"
+            "你是 DarkWar 游戏的社区分析助手。你的任务是**筛掉垃圾帖**，不是找精品帖。\n"
+            "默认判断为 yes（放行）。只有以下情况标 no：\n"
+            "- 纯水帖（只有"测试"、"哈哈"、"dddd"、纯数字）\n"
+            "- 纯表情/图片无文字\n"
+            "- 纯闲聊且与游戏完全无关（天气、午饭、打招呼）\n"
+            "- 明显的广告或刷屏\n"
+            "其他情况一律 yes。包括但不限于：玩家讨论、抱怨、提问、建议、分享体验、情绪表达。\n"
+            "记住：宁可错放一百，不要漏掉一个。\n"
             "对每个帖子回复一行：thread_id|yes/no|一句话理由\n"
             "帖子列表：\n" + "\n".join(lines)
         )
@@ -613,6 +613,12 @@ class DailyBot(discord.Client):
             print(f"🤖 第二层 AI 预筛通过: {len(passed_ids)} 个")
 
         candidates = [t for t in ai_prescreen_list if t["thread_id"] in passed_ids]
+        # 深度分析上限，按回复数排序取 top 20
+        MAX_DEEP_ANALYSIS = 20
+        if len(candidates) > MAX_DEEP_ANALYSIS:
+            candidates.sort(key=lambda x: x.get("reply_count", 0), reverse=True)
+            candidates = candidates[:MAX_DEEP_ANALYSIS]
+            print(f"⚠️ 预筛通过 {len(passed_ids)} 个，深度分析上限 {MAX_DEEP_ANALYSIS}，按回复数取 top {MAX_DEEP_ANALYSIS}")
         filtered_out = [t for t in ai_prescreen_list if t["thread_id"] not in passed_ids]
         for t in filtered_out:
             raw_data.append({**t, "filtered": True, "skip_reason": "ai_prescreen"})
