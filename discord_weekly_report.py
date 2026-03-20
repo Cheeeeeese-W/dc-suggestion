@@ -509,13 +509,14 @@ class DailyBot(discord.Client):
         start_time, end_time = self.get_range()
         threads_map = {}  # thread_id -> thread 对象
 
-        # 2a. 活跃帖子
+        # 2a. 活跃帖子（未归档 = 仍在讨论，不按创建时间过滤）
         for t in channel.threads:
-            if start_time <= t.created_at <= end_time:
-                threads_map[str(t.id)] = t
+            threads_map[str(t.id)] = t
         print(f"📡 活跃帖子: {len(threads_map)} 个")
 
-        # 2b. 归档帖子（分页拉取）
+        # 2b. 归档帖子（最近 14 天创建的，覆盖更广）
+        archived_start = end_time - timedelta(days=14)
+        archived_start = archived_start.replace(hour=0, minute=0, second=0, microsecond=0)
         archived_count = 0
         try:
             before = end_time
@@ -524,7 +525,7 @@ class DailyBot(discord.Client):
                 async for t in channel.archived_threads(before=before, limit=100):
                     got_any = True
                     tid = str(t.id)
-                    if tid not in threads_map and t.created_at >= start_time:
+                    if tid not in threads_map and t.created_at >= archived_start:
                         threads_map[tid] = t
                     before = min(before, t.created_at)
                 if not got_any:
