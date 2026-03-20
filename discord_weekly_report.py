@@ -648,11 +648,14 @@ class DailyBot(discord.Client):
                 if old_silent_days >= 3:
                     # 死帖：跳过分析，只更新基础数据
                     skip_analysis.append(t)
-                elif t["reply_count"] == old_reply_count:
-                    # 回复数没变化 → silent_days + 1，跳过分析
+                elif (t["reply_count"] - old_reply_count) < 5:
+                    # 回复数变化不足 5 → 跳过分析，更新 prev 为当前值
+                    t["prev_reply_count"] = t["reply_count"]  # 更新基准
+                    if t["reply_count"] == old_reply_count:
+                        t["silent_days"] = (old_silent_days or 0) + 1
                     skip_analysis.append(t)
                 else:
-                    # 回复数有变化 → 需要重新分析
+                    # 回复数变化 ≥ 5 → 需要重新分析
                     need_analysis.append(t)
             else:
                 # 新帖子 → 必须分析
