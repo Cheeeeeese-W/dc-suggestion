@@ -445,7 +445,7 @@ class DailyBot(discord.Client):
             res = await ai_client.chat.completions.create(
                 model=CONF["AI_MODEL"],
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1000,
+                max_tokens=4000,
             )
             text = res.choices[0].message.content.strip()
             print(f"🤖 AI 预筛原始输出 (前500字): {text[:500]}")
