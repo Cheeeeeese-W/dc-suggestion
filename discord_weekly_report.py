@@ -404,9 +404,6 @@ class DailyBot(discord.Client):
         # 回复数 < 1（完全没人回的帖子跳过）
         if thread_data.get("reply_count", 0) < 1:
             return False
-        # 参与人数 < 2（至少 OP + 1人）
-        if thread_data.get("participant_count", 0) < 2:
-            return False
         # 首帖内容 < 10 字符
         content = thread_data.get("first_content", "")
         if len(content) < 10:
@@ -561,18 +558,8 @@ class DailyBot(discord.Client):
                 # 统计回复数（首帖不算回复）
                 reply_count = max(0, (t.message_count or 1) - 1)
 
-                # 统计参与人数（跳过 bot）
-                participants = set()
-                try:
-                    async for m in t.history(limit=None, oldest_first=True):
-                        if getattr(m.author, "bot", False):
-                            continue
-                        participants.add(m.author.id)
-                except Exception:
-                    pass
-                if msg.author and not getattr(msg.author, "bot", False):
-                    participants.add(msg.author.id)
-                participant_count = max(1, len(participants))
+                # 参与人数估算：用 t.message_count 近似（避免遍历 history）
+                participant_count = max(1, min(t.message_count or 1, 50))
 
                 # 表情统计
                 pos_reactions, neg_reactions = self._reaction_polarity_counts(msg)
@@ -613,12 +600,14 @@ class DailyBot(discord.Client):
             print(f"🤖 第二层 AI 预筛通过: {len(passed_ids)} 个")
 
         candidates = [t for t in ai_prescreen_list if t["thread_id"] in passed_ids]
-        # 深度分析上限，按回复数排序取 top 20
-        MAX_DEEP_ANALYSIS = 20
+        # 深度分析上限，按热度综合排序取 top 30
+        MAX_DEEP_ANALYSIS = 30
         if len(candidates) > MAX_DEEP_ANALYSIS:
-            candidates.sort(key=lambda x: x.get("reply_count", 0), reverse=True)
+            for c in candidates:
+                c["_sort_score"] = c.get("reply_count", 0) + c.get("total_reactions", 0) + c.get("message_count", 0)
+            candidates.sort(key=lambda x: x.get("_sort_score", 0), reverse=True)
             candidates = candidates[:MAX_DEEP_ANALYSIS]
-            print(f"⚠️ 预筛通过 {len(passed_ids)} 个，深度分析上限 {MAX_DEEP_ANALYSIS}，按回复数取 top {MAX_DEEP_ANALYSIS}")
+            print(f"⚠️ 预筛通过 {len(passed_ids)} 个，深度分析上限 {MAX_DEEP_ANALYSIS}，按热度取 top {MAX_DEEP_ANALYSIS}")
         filtered_out = [t for t in ai_prescreen_list if t["thread_id"] not in passed_ids]
         for t in filtered_out:
             raw_data.append({**t, "filtered": True, "skip_reason": "ai_prescreen"})
