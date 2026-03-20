@@ -1,9 +1,27 @@
+"""
+Discord 社区监控工具 V2 — 日报升级
+基于原有 discord_weekly_report.py 改造
+
+V2 改动：
+- 调度改为每日（去掉 10:30 补偿检查）
+- SQLite 持久化 threads.db + GitHub Actions artifact
+- 拉取范围：活跃帖子 + 归档帖子，thread_id 去重
+- 三层过滤漏斗：规则过滤 → AI 预筛 → 深度分析
+- 增量分析：reply_count 变化才重新分析，silent_days >= 3 跳过
+- 满意度重定义：1-10（越高越满意）
+- 热度公式：消息数×1 + 反应数×1 + 参与人数×3，满意度≤3 热度×2
+- AI 分析取前 10 条消息（跳过 bot），每条截前 200 字符
+- 日报卡片：按帖子独立展示，分「新发现」和「有显著变化」两个区
+- 飞书多维表格：新帖子 batch_create，旧帖子 batch_update
+"""
+
 import asyncio
 import os
 import json
+import sqlite3
+import re
 import discord
 import requests
-import re
 from openai import AsyncOpenAI
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -24,15 +42,119 @@ def get_conf():
         "BITABLE_TABLE_ID": os.getenv("FEISHU_BITABLE_TABLE_ID"),
         "REFERENCE_TABLE_ID": os.getenv("FEISHU_REFERENCE_TABLE_ID"),
         "FEISHU_CHAT_ID": os.getenv("FEISHU_CHAT_ID"),
-        # 发送模式：prod 发群；test 发指定个人（open_id/user_id/union_id/chat_id 均可）
         "FEISHU_SEND_MODE": os.getenv("FEISHU_SEND_MODE", "prod"),
         "FEISHU_TEST_RECEIVE_ID": os.getenv("FEISHU_TEST_RECEIVE_ID"),
-        "FEISHU_TEST_RECEIVE_ID_TYPE": os.getenv("FEISHU_TEST_RECEIVE_ID_TYPE", "open_id")
+        "FEISHU_TEST_RECEIVE_ID_TYPE": os.getenv("FEISHU_TEST_RECEIVE_ID_TYPE", "open_id"),
+        "DB_PATH": os.getenv("DB_PATH", "threads.db"),
     }
 
 CONF = get_conf()
 
-# ===================== 2. 飞书 API 客户端 =====================
+# ===================== 2. SQLite 数据库 =====================
+DB_PATH = CONF["DB_PATH"]
+
+def init_db():
+    """初始化数据库（幂等）"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS threads (
+            thread_id TEXT PRIMARY KEY,
+            title TEXT,
+            channel_id TEXT,
+            author_name TEXT,
+            author_id TEXT,
+            created_at TEXT,
+            first_seen_at TEXT,
+            last_updated_at TEXT,
+            is_archived INTEGER DEFAULT 0,
+            category TEXT,
+            sub_category TEXT,
+            summary TEXT,
+            short_title TEXT,
+            sentiment INTEGER,
+            prev_sentiment INTEGER,
+            reply_count INTEGER,
+            prev_reply_count INTEGER,
+            participant_count INTEGER,
+            prev_participant_count INTEGER,
+            heat_score INTEGER,
+            heat_trend TEXT,
+            silent_days INTEGER DEFAULT 0,
+            hot_flag INTEGER DEFAULT 0,
+            filtered INTEGER DEFAULT 0,
+            record_id TEXT
+        )
+    """)
+    # 兼容旧库：若缺少 record_id 列则自动添加
+    try:
+        c.execute("ALTER TABLE threads ADD COLUMN record_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    conn.close()
+
+
+def get_thread(tid):
+    """获取单条帖子记录"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM threads WHERE thread_id = ?", (tid,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def save_thread(data):
+    """插入或更新帖子记录"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO threads (thread_id, title, channel_id, author_name, author_id,
+            created_at, first_seen_at, last_updated_at, is_archived,
+            category, sub_category, summary, short_title,
+            sentiment, prev_sentiment,
+            reply_count, prev_reply_count,
+            participant_count, prev_participant_count,
+            heat_score, heat_trend, silent_days, hot_flag, filtered, record_id)
+        VALUES (:thread_id, :title, :channel_id, :author_name, :author_id,
+            :created_at, :first_seen_at, :last_updated_at, :is_archived,
+            :category, :sub_category, :summary, :short_title,
+            :sentiment, :prev_sentiment,
+            :reply_count, :prev_reply_count,
+            :participant_count, :prev_participant_count,
+            :heat_score, :heat_trend, :silent_days, :hot_flag, :filtered, :record_id)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            title=excluded.title, channel_id=excluded.channel_id,
+            author_name=excluded.author_name, author_id=excluded.author_id,
+            last_updated_at=excluded.last_updated_at, is_archived=excluded.is_archived,
+            category=excluded.category, sub_category=excluded.sub_category,
+            summary=excluded.summary, short_title=excluded.short_title,
+            sentiment=excluded.sentiment, prev_sentiment=excluded.prev_sentiment,
+            reply_count=excluded.reply_count, prev_reply_count=excluded.prev_reply_count,
+            participant_count=excluded.participant_count,
+            prev_participant_count=excluded.prev_participant_count,
+            heat_score=excluded.heat_score, heat_trend=excluded.heat_trend,
+            silent_days=excluded.silent_days, hot_flag=excluded.hot_flag,
+            filtered=excluded.filtered, record_id=excluded.record_id
+    """, data)
+    conn.commit()
+    conn.close()
+
+
+def update_record_ids(thread_id_to_record_id: dict):
+    """批量更新 record_id（Bitable 同步后回写）"""
+    if not thread_id_to_record_id:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for tid, rid in thread_id_to_record_id.items():
+        c.execute("UPDATE threads SET record_id = ? WHERE thread_id = ?", (rid, tid))
+    conn.commit()
+    conn.close()
+
+
+# ===================== 3. 飞书 API 客户端 =====================
 class FeishuClient:
     def __init__(self):
         self.token = self._get_tenant_access_token()
@@ -40,71 +162,185 @@ class FeishuClient:
     def _get_tenant_access_token(self):
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         try:
-            res = requests.post(url, json={"app_id": CONF["FEISHU_APP_ID"], "app_secret": CONF["FEISHU_APP_SECRET"]}, timeout=10)
+            res = requests.post(url, json={
+                "app_id": CONF["FEISHU_APP_ID"],
+                "app_secret": CONF["FEISHU_APP_SECRET"]
+            }, timeout=10)
             return res.json().get("tenant_access_token")
-        except: return None
+        except Exception:
+            return None
 
+    # ---- 知识库 ----
     def get_knowledge_base(self):
         """从参考表读取 模块-二级分类-关键字 映射"""
-        if not self.token: return []
+        if not self.token:
+            return []
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/records"
         headers = {"Authorization": f"Bearer {self.token}"}
         try:
             res = requests.get(url, headers=headers, params={"page_size": 500}, timeout=10)
-            items = res.json().get('data', {}).get('items', [])
+            items = res.json().get("data", {}).get("items", [])
             kb = []
             for r in items:
-                f = r['fields']
-                if f.get('模块分类') and f.get('二级分类'):
-                    cat1 = f.get('模块分类')
-                    cat2 = f.get('二级分类')
-                    # 把“关键字”字段拆成列表；若为空，则默认仅使用「二级分类」文本作为关键字，避免模块级别的泛匹配
-                    raw_kw = str(f.get('关键字', '')).replace('，', ',')
-                    kw_list = [k.strip() for k in raw_kw.split(',') if k.strip()]
+                f = r["fields"]
+                if f.get("模块分类") and f.get("二级分类"):
+                    cat1 = f.get("模块分类")
+                    cat2 = f.get("二级分类")
+                    raw_kw = str(f.get("关键字", "")).replace("，", ",")
+                    kw_list = [k.strip() for k in raw_kw.split(",") if k.strip()]
                     if not kw_list:
                         kw_list = [str(cat2).strip()]
-                    kb.append({
-                        "cat1": cat1,
-                        "cat2": cat2,
-                        "keywords": kw_list
-                    })
+                    kb.append({"cat1": cat1, "cat2": cat2, "keywords": kw_list})
             return kb
-        except: return []
+        except Exception:
+            return []
 
     def add_new_reference(self, new_records):
-        """发现新分类组合时自动录入"""
-        if not self.token or not new_records: return
+        if not self.token or not new_records:
+            return
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['REFERENCE_TABLE_ID']}/records/batch_create"
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         records = [{"fields": {"模块分类": p[0], "二级分类": p[1], "关键字": ""}} for p in new_records]
-        requests.post(url, headers=headers, json={"records": records}, timeout=10)
+        try:
+            requests.post(url, headers=headers, json={"records": records}, timeout=10)
+        except Exception:
+            pass
 
-    def batch_add_bitable_records(self, records_list):
-        if not self.token or not records_list: return
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_create"
-        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        formatted = []
-        for r in records_list:
-            formatted.append({"fields": {
-                "日期": r.get("日期"),
-                "模块分类": r.get("模块分类"), 
-                "二级分类": r.get("二级分类"),
-                "热度分": int(r.get("热度分", 0)),
-                "参与人数": int(r.get("参与人数", 0)),
-                "AI核心总结": str(r.get("AI核心总结", "")),
-                "情绪得分": int(r.get("情绪得分", 5)),
-                "帖子链接": {"text": "点击查看帖子", "link": r.get("帖子链接")}
-            }})
-        res = requests.post(url, headers=headers, json={"records": formatted}, timeout=15)
-        print(f"✅ 主表同步: {res.json().get('msg')}")
+    # ---- Bitable 主表 ----
+    def _extract_thread_id_from_url(self, link_obj):
+        """从帖子链接 URL 中提取 thread_id"""
+        if isinstance(link_obj, dict):
+            url = link_obj.get("link", "")
+        elif isinstance(link_obj, str):
+            url = link_obj
+        else:
+            return None
+        m = re.search(r"/channels/\d+/(\d+)", url)
+        return m.group(1) if m else None
 
+    def query_bitable_existing(self) -> dict:
+        """
+        查询主表中所有已有记录，从帖子链接提取 thread_id。
+        返回 {thread_id: record_id}
+        """
+        if not self.token:
+            return {}
+        result = {}
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records"
+        headers = {"Authorization": f"Bearer {self.token}"}
+        page_token = None
+        while True:
+            params = {"page_size": 500}
+            if page_token:
+                params["page_token"] = page_token
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=15)
+                data = res.json().get("data", {})
+                for item in data.get("items", []):
+                    fields = item.get("fields", {})
+                    link = fields.get("帖子链接")
+                    tid = self._extract_thread_id_from_url(link)
+                    if tid:
+                        result[tid] = item["record_id"]
+                if not data.get("has_more"):
+                    break
+                page_token = data.get("page_token")
+            except Exception as e:
+                print(f"⚠️ Bitable 查询异常: {e}")
+                break
+        print(f"📋 Bitable 已有记录: {len(result)} 条")
+        return result
+
+    def sync_bitable(self, enriched_list: list):
+        """
+        同步数据到飞书多维表格。
+        - 新帖子（Bitable 中无记录）→ batch_create
+        - 旧帖子（Bitable 中有记录）→ batch_update
+        返回 {thread_id: record_id} 映射，用于回写 SQLite。
+        """
+        if not self.token or not enriched_list:
+            return {}
+
+        # 1) 查询 Bitable 中已有记录（从帖子链接提取 thread_id）
+        existing = self.query_bitable_existing()
+
+        # 2) 分组：新增 vs 更新
+        new_records = []
+        update_records = []
+        for e in enriched_list:
+            tid = str(e["thread_id"])
+            fields = {
+                "日期": e.get("date_ms"),
+                "模块分类": e.get("模块分类"),
+                "二级分类": e.get("二级分类"),
+                "热度分": int(e.get("heat_score", 0)),
+                "参与人数": int(e.get("参与人数", 1)),
+                "AI核心总结": str(e.get("AI核心总结", "")),
+                "满意度": int(e.get("sentiment", 5)) if e.get("sentiment") is not None else 5,
+                "回复数": int(e.get("reply_count", 0)),
+                "帖子链接": {"text": "点击查看帖子", "link": e.get("帖子链接")},
+            }
+            # 变化指标（仅更新时有意义）
+            sd = e.get("sentiment_delta")
+            rd = e.get("reply_delta")
+            if sd is not None:
+                fields["满意度变化"] = int(sd)
+            if rd is not None:
+                fields["回复数变化"] = int(rd)
+            is_new = e.get("is_new", False)
+            fields["状态"] = "新发现" if is_new else "有变化"
+
+            if tid in existing:
+                fields["状态"] = "有变化"
+                update_records.append({"record_id": existing[tid], "fields": fields})
+            else:
+                new_records.append({"fields": fields})
+
+        result = dict(existing)  # 保留已有映射
+
+        # 3) batch_create（每批 500 条）
+        if new_records:
+            url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_create"
+            headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+            for i in range(0, len(new_records), 500):
+                batch = new_records[i:i + 500]
+                try:
+                    res = requests.post(url, headers=headers, json={"records": batch}, timeout=15)
+                    resp = res.json()
+                    if resp.get("code") == 0:
+                        created = resp.get("data", {}).get("records", [])
+                        print(f"✅ Bitable 新增 {len(created)} 条")
+                    else:
+                        print(f"❌ Bitable batch_create 失败: {resp.get('msg')}")
+                except Exception as e:
+                    print(f"❌ Bitable batch_create 异常: {e}")
+
+        # 4) batch_update（每批 500 条）
+        if update_records:
+            url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records/batch_update"
+            headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+            for i in range(0, len(update_records), 500):
+                batch = update_records[i:i + 500]
+                try:
+                    res = requests.post(url, headers=headers, json={"records": batch}, timeout=15)
+                    resp = res.json()
+                    if resp.get("code") == 0:
+                        print(f"✅ Bitable 更新 {len(batch)} 条")
+                    else:
+                        print(f"❌ Bitable batch_update 失败: {resp.get('msg')}")
+                except Exception as e:
+                    print(f"❌ Bitable batch_update 异常: {e}")
+
+        return result
+
+    # ---- 发送卡片 ----
     def send_group_card(self, card_content):
-        if not self.token: return
+        if not self.token:
+            return False
         mode = str(CONF.get("FEISHU_SEND_MODE", "prod")).strip().lower()
         if mode == "test":
             receive_id = CONF.get("FEISHU_TEST_RECEIVE_ID")
             receive_id_type = str(CONF.get("FEISHU_TEST_RECEIVE_ID_TYPE", "open_id")).strip() or "open_id"
-            # 测试模式未配置个人接收者时，自动回退到群，避免消息丢失
             if not receive_id:
                 print("⚠️ FEISHU_SEND_MODE=test 但未配置 FEISHU_TEST_RECEIVE_ID，已回退群聊发送")
                 receive_id = CONF.get("FEISHU_CHAT_ID")
@@ -128,19 +364,19 @@ class FeishuClient:
             print(f"❌ 飞书卡片发送异常: {e}")
             return False
 
-# ===================== 3. 机器人核心逻辑 =====================
-class AdvancedBot(discord.Client):
+
+# ===================== 4. 机器人核心逻辑 =====================
+class DailyBot(discord.Client):
+
+    # ---- 时间范围：最近 7 天（每日跑，覆盖足够窗口） ----
     def get_range(self):
         now = datetime.now(timezone.utc)
-        this_mon = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        return this_mon - timedelta(days=7), this_mon - timedelta(seconds=1)
+        start = now - timedelta(days=7)
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start, now
 
+    # ---- 表情正负向统计 ----
     def _reaction_polarity_counts(self, msg):
-        """
-        统计首帖反应的正负向数量：
-        - 正向：赞 / 100分 / UP
-        - 负向：踩
-        """
         positive = 0
         negative = 0
         for r in (getattr(msg, "reactions", None) or []):
@@ -148,13 +384,9 @@ class AdvancedBot(discord.Client):
             emoji_raw = str(getattr(r, "emoji", "")).lower()
             emoji_name = str(getattr(getattr(r, "emoji", None), "name", "")).lower()
             token = f"{emoji_raw} {emoji_name}"
-
-            # 负向：踩
             if ("👎" in token) or ("thumbsdown" in token) or ("thumb_down" in token) or ("downvote" in token) or ("-1" in token):
                 negative += cnt
                 continue
-
-            # 正向：赞 / 100分 / UP
             if ("👍" in token) or ("thumbsup" in token) or ("thumb_up" in token) or ("upvote" in token) or ("+1" in token):
                 positive += cnt
                 continue
@@ -166,262 +398,601 @@ class AdvancedBot(discord.Client):
                 continue
         return positive, negative
 
+    # ---- 第一层：规则过滤 ----
+    def _rule_filter(self, thread_data: dict) -> bool:
+        """返回 True = 通过过滤"""
+        # 回复数 < 2
+        if thread_data.get("reply_count", 0) < 2:
+            return False
+        # 参与人数 < 2
+        if thread_data.get("participant_count", 0) < 2:
+            return False
+        # 首帖内容 < 10 字符
+        content = thread_data.get("first_content", "")
+        if len(content) < 10:
+            return False
+        # 黑名单关键词
+        blacklist = ["测试", "哈哈", "dddd"]
+        name_lower = thread_data.get("title", "").lower()
+        content_lower = content.lower()
+        for kw in blacklist:
+            if kw in name_lower or kw in content_lower:
+                return False
+        # 负向表情 > 正向
+        if thread_data.get("neg_reactions", 0) > thread_data.get("pos_reactions", 0):
+            return False
+        return True
+
+    # ---- 第二层：AI 预筛（~100 token/帖） ----
+    async def _ai_prescreen(self, thread_list: list, ai_client) -> set:
+        """返回通过预筛的 thread_id 集合"""
+        if not thread_list:
+            return set()
+        lines = []
+        for t in thread_list:
+            content_preview = t.get("first_content", "")[:100]
+            lines.append(f"[{t['thread_id']}] {t['title']} | {content_preview}")
+        prompt = (
+            "你是 DarkWar 游戏的策划分析师。判断以下帖子是否包含对策划有价值的真实玩家反馈（需求/建议/bug/情绪表达）。\n"
+            "排除：测试帖、闲聊、水帖、纯表情、无意义内容。\n"
+            "对每个帖子回复一行：thread_id|yes/no|一句话理由\n"
+            "帖子列表：\n" + "\n".join(lines)
+        )
+        try:
+            res = await ai_client.chat.completions.create(
+                model=CONF["AI_MODEL"],
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+            )
+            text = res.choices[0].message.content.strip()
+            passed = set()
+            for line in text.split("\n"):
+                parts = line.strip().split("|")
+                if len(parts) >= 2:
+                    tid = parts[0].strip()
+                    decision = parts[1].strip().lower()
+                    if "yes" in decision:
+                        passed.add(tid)
+            return passed
+        except Exception as e:
+            print(f"⚠️ AI 预筛异常: {e}")
+            # 预筛失败时放行所有帖子
+            return {t["thread_id"] for t in thread_list}
+
+    # ---- 计算热度 ----
+    def _calc_heat(self, msg_count, reaction_count, participant_count, sentiment):
+        """热度 = 消息数×1 + 反应数×1 + 参与人数×3，满意度≤3 热度×2"""
+        heat = msg_count * 1 + reaction_count * 1 + participant_count * 3
+        if sentiment <= 3:
+            heat *= 2
+        elif sentiment <= 5:
+            heat *= 1.5
+        return int(heat)
+
+    # ---- 满意度颜色 ----
+    def _sentiment_color(self, score):
+        """满意度：1-10 越高越满意"""
+        if score <= 3:
+            return "red"
+        if score <= 5:
+            return "orange"
+        return "green"
+
+    def _template_by_sentiment(self, score):
+        if score <= 3:
+            return "red"
+        if score <= 5:
+            return "orange"
+        return "green"
+
+    # ==================== 主流程 ====================
     async def on_ready(self):
-        print(f"🚀 系统就绪: {self.user}")
+        print(f"🚀 V2 日报系统就绪: {self.user}")
         channel = self.get_channel(CONF["CHANNEL_ID"])
         feishu = FeishuClient()
-        ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=CONF["AI_BASE_URL"].strip().rstrip('/') + '/v1')
-        
+        ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=CONF["AI_BASE_URL"].strip().rstrip("/") + "/v1")
+
+        # 0. 初始化数据库
+        init_db()
+
         # 1. 加载术语参考库
         kb = feishu.get_knowledge_base()
         print(f"📚 已从飞书加载 {len(kb)} 条分类映射规则")
-        
-        start_time, end_time = self.get_range()
-        threads = []
-        async for t in channel.archived_threads(before=end_time, limit=100):
-            if t.created_at >= start_time: threads.append(t)
-        for t in channel.threads:
-            if start_time <= t.created_at <= end_time: threads.append(t)
 
+        # 2. 拉取帖子：活跃 + 归档，去重
+        start_time, end_time = self.get_range()
+        threads_map = {}  # thread_id -> thread 对象
+
+        # 2a. 活跃帖子
+        for t in channel.threads:
+            if start_time <= t.created_at <= end_time:
+                threads_map[str(t.id)] = t
+        print(f"📡 活跃帖子: {len(threads_map)} 个")
+
+        # 2b. 归档帖子（分页拉取）
+        archived_count = 0
+        try:
+            before = end_time
+            for _ in range(20):  # 最多 20 页
+                got_any = False
+                async for t in channel.archived_threads(before=before, limit=100):
+                    got_any = True
+                    tid = str(t.id)
+                    if tid not in threads_map and t.created_at >= start_time:
+                        threads_map[tid] = t
+                    before = min(before, t.created_at)
+                if not got_any:
+                    break
+                archived_count += 1
+        except Exception as e:
+            print(f"⚠️ 归档拉取异常: {e}")
+        print(f"📡 归档帖子: {archived_count} 页, 去重后总计 {len(threads_map)} 个")
+
+        if not threads_map:
+            print("📭 无帖子，退出")
+            await self.close()
+            return
+
+        # 3. 基础数据采集 + 三层过滤
         raw_data = []
-        for index, t in enumerate(threads):
+        ai_prescreen_list = []  # 通过第一层的帖子列表（给 AI 预筛）
+
+        for tid, t in threads_map.items():
             try:
+                # 获取首帖
                 msg = None
-                # 仅以线程首条消息作为分析对象；如果首条消息已被删除，则忽略该帖子
                 try:
                     msg = await t.fetch_message(t.id)
-                except:
+                except Exception:
                     msg = None
 
-                # 如果首条消息不存在或内容被玩家删除（空内容），则忽略该帖子
-                if not msg or not str(msg.content).strip():
+                if not msg:
                     continue
 
-                # 表情倾向过滤：负向（踩）占主导则忽略该帖子
-                pos_count, neg_count = self._reaction_polarity_counts(msg)
-                if neg_count > pos_count:
-                    print(f"⏭️ 忽略（负向主导）: {t.name} | 正向={pos_count}, 负向={neg_count}")
-                    continue
+                first_content = str(msg.content or "").strip()
 
-                # 统计实际参与人数：按在线程中发过言的唯一玩家 ID 计数（忽略机器人）
+                # 统计回复数（首帖不算回复）
+                reply_count = max(0, (t.message_count or 1) - 1)
+
+                # 统计参与人数（跳过 bot）
                 participants = set()
                 try:
                     async for m in t.history(limit=None, oldest_first=True):
                         if getattr(m.author, "bot", False):
                             continue
                         participants.add(m.author.id)
-                except:
-                    # 如果遍历历史失败，至少算上首发作者
+                except Exception:
+                    pass
+                if msg.author and not getattr(msg.author, "bot", False):
                     participants.add(msg.author.id)
-                if not participants:
-                    participants.add(msg.author.id)
+                participant_count = max(1, len(participants))
 
-                raw_data.append({
-                    "id": index, "标题": t.name, "内容": msg.content[:600],
-                    "热度分": int((t.message_count * 3) + (sum([r.count for r in msg.reactions]) * 1)),
-                    "owner_id": msg.author.id,
-                    "参与人数": len(participants),
-                    "日期": int(t.created_at.timestamp() * 1000),
-                    "帖子链接": f"https://discord.com/channels/{t.guild.id}/{t.id}"
-                })
-            except: continue
+                # 表情统计
+                pos_reactions, neg_reactions = self._reaction_polarity_counts(msg)
+                total_reactions = sum(r.count for r in (msg.reactions or []))
 
-        if not raw_data: await self.close(); return
-
-        # 2. AI 深度分析
-        print(f"🤖 正在调用 AI 进行分类总结...")
-        items_str = "\n".join([f"ID: {i['id']} | 标题: {i['标题']} | 内容: {i['内容']}" for i in raw_data])
-        
-        # 构造参考列表供 AI 学习
-        ref_guide = "\n".join([f"- {e['cat1']} | {e['cat2']} (关键字: {','.join(e['keywords'])})" for e in kb])
-
-        prompt = f"""分析《DarkWar》玩家建议并输出 JSON []。
-        
-        【分类参考库】：
-        {ref_guide if ref_guide else "暂无，请根据内容自创规范的中文分类"}
-
-        【要求】：
-        1. 输出必须为简体中文。
-        2. category 和 sub_category 只输出单个最合适的分类（不要列表）。
-        3. summary 必须是对建议的一句话精炼总结。
-        4. short_title 必须是 10 字以内的中文短标题，用于卡片展示。
-        5. sentiment 为 1-10 分，分数越高代表玩家越愤怒（10 最愤怒，1 最平和）。
-
-        输出字段: id, sentiment(1-10), category(单个字符串), sub_category(单个字符串), short_title(10字以内), summary(中文)。
-        数据：\n{items_str}"""
-
-        all_enriched, new_kb_records = [], set()
-        try:
-            res = await ai_client.chat.completions.create(model=CONF["AI_MODEL"], messages=[{"role": "user", "content": prompt}], response_format={"type": "json_object"})
-            js = res.choices[0].message.content.strip()
-            if "```json" in js: js = js.split("```json")[1].split("```")[0].strip()
-            ai_res = json.loads(js)
-            if isinstance(ai_res, dict):
-                for k in ai_res:
-                    if isinstance(ai_res[k], list): ai_res = ai_res[k]; break
-            
-            ai_map = {item['id']: item for item in ai_res if isinstance(item, dict)}
-            
-            for o in raw_data:
-                ai_info = ai_map.get(o['id'], {})
-                
-                # 将输入统一为「字符串列表」，便于兼容 AI 偶发返回 list/字符串
-                def to_l(v, d):
-                    return [str(i).strip()[:20] for i in (v if isinstance(v, list) else [v] if v else [d])]
-
-                # AI 原始分类结果（兜底）
-                ai_c1 = to_l(ai_info.get('category'), "其他")
-                ai_c2 = to_l(ai_info.get('sub_category'), "通用")
-                ai_cat1 = ai_c1[0]
-                ai_cat2 = ai_c2[0]
-
-                # 2）只用「AI 的分类文本 + 总结」做关键字匹配，不直接用玩家原始文本，避免误伤
-                label_text = (
-                    " ".join(ai_c1) + " " +
-                    " ".join(ai_c2) + " " +
-                    str(ai_info.get("summary", ""))
-                ).upper()
-
-                # 3）单选策略：按“匹配得分”选一个最合适的标准标签
-                pair_scores = {}  # {(cat1, cat2): score}
-                for entry in kb:
-                    pair = (entry['cat1'], entry['cat2'])
-                    score = 0
-                    for kw in entry['keywords']:
-                        kw = (kw or "").strip()
-                        if not kw:
-                            continue
-                        if kw.upper() in label_text:
-                            # 关键字命中是主权重
-                            score += 3
-                    # AI 与参考库字段一致时给额外分，帮助从多个命中中挑最贴切
-                    if entry['cat1'] in ai_c1:
-                        score += 2
-                    if entry['cat2'] in ai_c2:
-                        score += 4
-                    if score > 0:
-                        pair_scores[pair] = pair_scores.get(pair, 0) + score
-
-                if pair_scores:
-                    # 选得分最高的单个标签；并列时按字典序稳定选择
-                    best_pair = sorted(pair_scores.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))[0][0]
-                    c1, c2 = best_pair[0], best_pair[1]
-                else:
-                    # 没命中参考库：用 AI 单选结果，并自动补录新组合
-                    c1, c2 = ai_cat1, ai_cat2
-                    if c1 not in ("其他", "", None) and c2 not in ("通用", "", None):
-                        if not any(e['cat1'] == c1 and e['cat2'] == c2 for e in kb):
-                            new_kb_records.add((c1, c2))
-
-                all_enriched.append({
-                    **o,
-                    "模块分类": c1,
-                    "二级分类": c2,
-                    "情绪得分": int(ai_info.get('sentiment', 5)),
-                    "AI短标题": str(ai_info.get('short_title') or ai_info.get('title') or ai_info.get('summary', o['标题'])),
-                    "AI核心总结": str(ai_info.get('summary', o['标题'])),
-                    # 参与人数：优先使用前面 raw_data 中真实统计到的参与人数，兜底为 1
-                    "参与人数": int(o.get("参与人数", 1)) or 1
-                })
-        except Exception as e:
-            print(f"❌ AI 分析异常: {e}"); await self.close(); return
-
-        # 3. 排序、录入主表、更新参考库
-        all_enriched.sort(key=lambda x: x['日期'], reverse=True)
-        feishu.batch_add_bitable_records(all_enriched)
-        feishu.add_new_reference(list(new_kb_records))
-
-        # 4. 话题聚合卡片逻辑 (现在基于“二级分类”聚合)
-        cat_groups = {}
-        for item in all_enriched:
-            sub_cat = str(item.get("二级分类", "通用")).strip() or "通用"
-            item_heat = int(item.get("热度分", 0))
-            item_sentiment = int(item.get("情绪得分", 5))
-            if sub_cat not in cat_groups:
-                cat_groups[sub_cat] = {
-                    "name": sub_cat, "cat1": str(item.get("模块分类", "其他")).strip() or "其他",
-                    "heat": 0, "count": 0, "user_count": 0,
-                    "sentiment_total": 0,
-                    "summary": item["AI核心总结"],
-                    "short_title": item.get("AI短标题", item["AI核心总结"]),
-                    # 代表建议：优先热度，其次情绪，用于卡片标题与概述
-                    "best_rank": (item_heat, item_sentiment)
+                thread_data = {
+                    "thread_id": tid,
+                    "title": t.name,
+                    "first_content": first_content,
+                    "reply_count": reply_count,
+                    "participant_count": participant_count,
+                    "pos_reactions": pos_reactions,
+                    "neg_reactions": neg_reactions,
+                    "total_reactions": total_reactions,
+                    "message_count": t.message_count or 1,
+                    "created_at": t.created_at,
+                    "is_archived": getattr(t, "archived", False),
+                    "author_name": str(msg.author) if msg.author else "unknown",
+                    "author_id": str(msg.author.id) if msg.author else "0",
+                    "帖子链接": f"https://discord.com/channels/{t.guild.id}/{t.id}",
                 }
-            g = cat_groups[sub_cat]
-            g["heat"] += item["热度分"]
-            g["count"] += 1
-            g["user_count"] += int(item.get("参与人数", 1)) or 1
-            g["sentiment_total"] += int(item.get("情绪得分", 5))
-            current_rank = (item_heat, item_sentiment)
-            if current_rank > g.get("best_rank", (-1, -1)):
-                g["best_rank"] = current_rank
-                g["summary"] = item["AI核心总结"]
-                g["short_title"] = item.get("AI短标题", item["AI核心总结"])
 
-        summary_list = []
-        for v in cat_groups.values():
-            summary_list.append({
-                "topic": v["name"], "category": v["cat1"],
-                "total_heat": v["heat"], "thread_count": v["count"],
-                "user_count": v["user_count"], "summary": v["summary"],
-                "short_title": v.get("short_title", v["summary"]),
-                "tag_list": [f"{v['cat1']}-{v['name']}"],
-                "avg_sentiment": round(v["sentiment_total"] / v["count"], 1) if v["count"] else 5.0
+                # 第一层：规则过滤
+                if self._rule_filter(thread_data):
+                    ai_prescreen_list.append(thread_data)
+                else:
+                    # 标记为已过滤，但仍然入库（基础数据用于增量对比）
+                    raw_data.append({**thread_data, "filtered": True, "skip_reason": "rule_filter"})
+            except Exception:
+                continue
+
+        print(f"🔍 第一层规则过滤通过: {len(ai_prescreen_list)} 个")
+
+        # 4. 第二层：AI 预筛
+        passed_ids = set()
+        if ai_prescreen_list:
+            passed_ids = await self._ai_prescreen(ai_prescreen_list, ai_client)
+            print(f"🤖 第二层 AI 预筛通过: {len(passed_ids)} 个")
+
+        candidates = [t for t in ai_prescreen_list if t["thread_id"] in passed_ids]
+        filtered_out = [t for t in ai_prescreen_list if t["thread_id"] not in passed_ids]
+        for t in filtered_out:
+            raw_data.append({**t, "filtered": True, "skip_reason": "ai_prescreen"})
+
+        if not candidates:
+            print("📭 无候选帖子进入深度分析")
+
+        # 5. 增量判断：哪些帖子需要深度分析
+        now_str = datetime.now(timezone.utc).isoformat()
+        need_analysis = []
+        skip_analysis = []
+
+        for t in candidates:
+            existing = get_thread(t["thread_id"])
+            if existing:
+                # existing: (thread_id, title, channel_id, author_name, author_id,
+                #   created_at, first_seen_at, last_updated_at, is_archived,
+                #   category, sub_category, summary, short_title,
+                #   sentiment, prev_sentiment, reply_count, prev_reply_count,
+                #   participant_count, prev_participant_count,
+                #   heat_score, heat_trend, silent_days, hot_flag, filtered, record_id)
+                old_reply_count = existing[16]  # reply_count
+                old_sentiment = existing[13]     # sentiment
+                old_silent_days = existing[21]   # silent_days
+
+                # 保存旧值用于后续计算
+                t["prev_reply_count"] = old_reply_count
+                t["prev_sentiment"] = old_sentiment
+                t["old_category"] = existing[9]
+                t["old_sub_category"] = existing[10]
+                t["old_summary"] = existing[11]
+                t["old_short_title"] = existing[12]
+                t["old_participant_count"] = existing[17]
+                t["old_heat_score"] = existing[19]
+                t["record_id"] = existing[24]
+                t["is_new"] = False
+
+                if old_silent_days >= 3:
+                    # 死帖：跳过分析，只更新基础数据
+                    skip_analysis.append(t)
+                elif t["reply_count"] == old_reply_count:
+                    # 回复数没变化 → silent_days + 1，跳过分析
+                    skip_analysis.append(t)
+                else:
+                    # 回复数有变化 → 需要重新分析
+                    need_analysis.append(t)
+            else:
+                # 新帖子 → 必须分析
+                t["prev_reply_count"] = 0
+                t["prev_sentiment"] = None
+                t["is_new"] = True
+                t["record_id"] = None
+                need_analysis.append(t)
+
+        print(f"📊 需要深度分析: {len(need_analysis)} 个, 跳过分析: {len(skip_analysis)} 个")
+
+        # 6. 第三层：深度分析（AI）
+        all_enriched = []
+        new_kb_records = set()
+
+        if need_analysis:
+            # 构造 AI 上下文：每帖取前 10 条消息（跳过 bot），每条截前 200 字符
+            items_for_ai = []
+            for t in need_analysis:
+                # 获取前 10 条非 bot 消息
+                msg_texts = []
+                try:
+                    async for m in t_fetch_messages(t, 10):
+                        if getattr(m.author, "bot", False):
+                            continue
+                        text = str(m.content or "")[:200]
+                        if text.strip():
+                            msg_texts.append(text)
+                except Exception:
+                    if t.get("first_content"):
+                        msg_texts.append(t["first_content"][:200])
+
+                msg_block = "\n".join(msg_texts) if msg_texts else t.get("first_content", "")[:200]
+                items_for_ai.append(
+                    f"ID: {t['thread_id']} | 标题: {t['title']} | 消息:\n{msg_block}"
+                )
+
+            ref_guide = "\n".join([f"- {e['cat1']} | {e['cat2']} (关键字: {','.join(e['keywords'])})" for e in kb])
+
+            prompt = f"""分析《DarkWar》玩家建议并输出 JSON []。
+
+【分类参考库】：
+{ref_guide if ref_guide else "暂无，请根据内容自创规范的中文分类"}
+
+【要求】：
+1. 输出必须为简体中文。
+2. category 和 sub_category 只输出单个最合适的分类（不要列表）。
+3. summary 必须是对建议的一句话精炼总结。
+4. short_title 必须是 10 字以内的中文短标题，用于卡片展示。
+5. sentiment 为 1-10 分，分数越高代表玩家越满意（10 最满意，1 最愤怒）。
+   - 1-2：极度不满（暴怒、威胁退游）
+   - 3-4：明显不满（强烈吐槽）
+   - 5-6：中性（混合反馈）
+   - 7-8：比较满意（认可但有建议）
+   - 9-10：非常满意（赞扬）
+
+输出字段: id, sentiment(1-10), category(单个字符串), sub_category(单个字符串), short_title(10字以内), summary(中文)。
+数据：\n{chr(10).join(items_for_ai)}"""
+
+            try:
+                print(f"🤖 第三层深度分析中 ({len(need_analysis)} 帖)...")
+                res = await ai_client.chat.completions.create(
+                    model=CONF["AI_MODEL"],
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                )
+                js = res.choices[0].message.content.strip()
+                if "```json" in js:
+                    js = js.split("```json")[1].split("```")[0].strip()
+                ai_res = json.loads(js)
+                if isinstance(ai_res, dict):
+                    for k in ai_res:
+                        if isinstance(ai_res[k], list):
+                            ai_res = ai_res[k]
+                            break
+
+                ai_map = {item["id"]: item for item in ai_res if isinstance(item, dict)}
+
+                for t in need_analysis:
+                    ai_info = ai_map.get(t["thread_id"], {})
+
+                    def to_l(v, d):
+                        return [str(i).strip()[:20] for i in (v if isinstance(v, list) else [v] if v else [d])]
+
+                    ai_c1 = to_l(ai_info.get("category"), "其他")
+                    ai_c2 = to_l(ai_info.get("sub_category"), "通用")
+
+                    label_text = (" ".join(ai_c1) + " " + " ".join(ai_c2) + " " + str(ai_info.get("summary", ""))).upper()
+
+                    pair_scores = {}
+                    for entry in kb:
+                        pair = (entry["cat1"], entry["cat2"])
+                        score = 0
+                        for kw in entry["keywords"]:
+                            kw = (kw or "").strip()
+                            if not kw:
+                                continue
+                            if kw.upper() in label_text:
+                                score += 3
+                        if entry["cat1"] in ai_c1:
+                            score += 2
+                        if entry["cat2"] in ai_c2:
+                            score += 4
+                        if score > 0:
+                            pair_scores[pair] = pair_scores.get(pair, 0) + score
+
+                    if pair_scores:
+                        best_pair = sorted(pair_scores.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))[0][0]
+                        c1, c2 = best_pair[0], best_pair[1]
+                    else:
+                        c1, c2 = ai_c1[0], ai_c2[0]
+                        if c1 not in ("其他", "", None) and c2 not in ("通用", "", None):
+                            if not any(e["cat1"] == c1 and e["cat2"] == c2 for e in kb):
+                                new_kb_records.add((c1, c2))
+
+                    sentiment = int(ai_info.get("sentiment", 5))
+                    heat = self._calc_heat(
+                        t.get("message_count", 1),
+                        t.get("total_reactions", 0),
+                        t.get("participant_count", 1),
+                        sentiment,
+                    )
+
+                    all_enriched.append({
+                        **t,
+                        "模块分类": c1,
+                        "二级分类": c2,
+                        "sentiment": sentiment,
+                        "AI短标题": str(ai_info.get("short_title") or ai_info.get("summary", t["title"]))[:10],
+                        "AI核心总结": str(ai_info.get("summary", t["title"])),
+                        "heat_score": heat,
+                        "filtered": False,
+                    })
+            except Exception as e:
+                print(f"❌ AI 深度分析异常: {e}")
+                # 降级：用默认值
+                for t in need_analysis:
+                    heat = self._calc_heat(
+                        t.get("message_count", 1),
+                        t.get("total_reactions", 0),
+                        t.get("participant_count", 1),
+                        5,
+                    )
+                    all_enriched.append({
+                        **t,
+                        "模块分类": "其他",
+                        "二级分类": "通用",
+                        "sentiment": 5,
+                        "AI短标题": t["title"][:10],
+                        "AI核心总结": t.get("first_content", "")[:50],
+                        "heat_score": heat,
+                        "filtered": False,
+                    })
+
+        # 7. 处理跳过分析的帖子（保留旧分析结果，更新基础数据）
+        for t in skip_analysis:
+            old_sentiment = t.get("prev_sentiment", 5) or 5
+            old_category = t.get("old_category", "其他") or "其他"
+            old_sub_category = t.get("old_sub_category", "通用") or "通用"
+            old_summary = t.get("old_summary", "") or ""
+            old_short_title = t.get("old_short_title", "") or ""
+            heat = self._calc_heat(
+                t.get("message_count", 1),
+                t.get("total_reactions", 0),
+                t.get("participant_count", 1),
+                old_sentiment,
+            )
+
+            all_enriched.append({
+                **t,
+                "模块分类": old_category,
+                "二级分类": old_sub_category,
+                "sentiment": old_sentiment,
+                "AI短标题": old_short_title,
+                "AI核心总结": old_summary,
+                "heat_score": heat,
+                "filtered": False,
             })
 
-        if summary_list:
-            # 卡片按总热度分排序
-            summary_list.sort(key=lambda x: x['total_heat'], reverse=True)
-            await self.send_weekly_card(summary_list[:5], feishu, start_time, len(all_enriched))
-        
+        # 8. 处理被过滤的帖子（基础数据入库，不进入分析）
+        filtered_enriched = []
+        for t in [d for d in raw_data if d.get("filtered")]:
+            filtered_enriched.append({
+                **t,
+                "模块分类": "",
+                "二级分类": "",
+                "sentiment": None,
+                "AI短标题": "",
+                "AI核心总结": "",
+                "heat_score": 0,
+            })
+
+        # 合并所有帖子
+        everything = all_enriched + filtered_enriched
+
+        if not everything:
+            print("📭 无数据，退出")
+            await self.close()
+            return
+
+        # 9. 计算增量 & heat_trend
+        for e in everything:
+            if e.get("is_new"):
+                e["sentiment_delta"] = None
+                e["reply_delta"] = e.get("reply_count", 0)
+            else:
+                prev_s = e.get("prev_sentiment")
+                e["sentiment_delta"] = (e["sentiment"] - prev_s) if (e.get("sentiment") is not None and prev_s is not None) else None
+                e["reply_delta"] = (e.get("reply_count", 0) - (e.get("prev_reply_count") or 0))
+
+            # heat_trend
+            old_heat = e.get("old_heat_score")
+            new_heat = e.get("heat_score", 0)
+            if old_heat is None:
+                e["heat_trend"] = "rising"
+            elif new_heat > old_heat * 1.2:
+                e["heat_trend"] = "rising"
+            elif new_heat < old_heat * 0.8:
+                e["heat_trend"] = "cooling"
+            else:
+                e["heat_trend"] = "stable"
+
+            # silent_days
+            if e.get("filtered"):
+                e["silent_days"] = (e.get("old_silent_days") or 0) + 1 if not e.get("is_new") else 0
+            elif e.get("is_new"):
+                e["silent_days"] = 0
+            elif e.get("reply_count") == e.get("prev_reply_count"):
+                e["silent_days"] = (e.get("old_silent_days") or 0) + 1
+            else:
+                e["silent_days"] = 0
+
+        # 10. 保存到 SQLite
+        for e in everything:
+            save_thread({
+                "thread_id": e["thread_id"],
+                "title": e.get("title", ""),
+                "channel_id": str(CONF["CHANNEL_ID"]),
+                "author_name": e.get("author_name", ""),
+                "author_id": e.get("author_id", ""),
+                "created_at": e["created_at"].isoformat() if isinstance(e.get("created_at"), datetime) else str(e.get("created_at", "")),
+                "first_seen_at": e["created_at"].isoformat() if e.get("is_new") and isinstance(e.get("created_at"), datetime) else None,
+                "last_updated_at": now_str,
+                "is_archived": 1 if e.get("is_archived") else 0,
+                "category": e.get("模块分类", ""),
+                "sub_category": e.get("二级分类", ""),
+                "summary": e.get("AI核心总结", ""),
+                "short_title": e.get("AI短标题", ""),
+                "sentiment": e.get("sentiment"),
+                "prev_sentiment": e.get("prev_sentiment"),
+                "reply_count": e.get("reply_count", 0),
+                "prev_reply_count": e.get("prev_reply_count"),
+                "participant_count": e.get("participant_count", 0),
+                "prev_participant_count": e.get("old_participant_count"),
+                "heat_score": e.get("heat_score", 0),
+                "heat_trend": e.get("heat_trend", "stable"),
+                "silent_days": e.get("silent_days", 0),
+                "hot_flag": 1 if (e.get("heat_score", 0) > 50 and not e.get("filtered")) else 0,
+                "filtered": 1 if e.get("filtered") else 0,
+                "record_id": e.get("record_id"),
+            })
+
+        # 11. 飞书多维表格同步
+        sync_list = [e for e in everything if not e.get("filtered")]
+        for e in sync_list:
+            e["date_ms"] = int(e["created_at"].timestamp() * 1000) if isinstance(e.get("created_at"), datetime) else 0
+        record_id_map = feishu.sync_bitable(sync_list)
+        if record_id_map:
+            update_record_ids(record_id_map)
+
+        # 12. 更新参考库
+        feishu.add_new_reference(list(new_kb_records))
+
+        # 13. 发送日报卡片
+        # 分类：新发现 vs 有显著变化
+        new_discoveries = [e for e in all_enriched if e.get("is_new") and not e.get("filtered")]
+        significant_changes = []
+        for e in all_enriched:
+            if e.get("is_new") or e.get("filtered"):
+                continue
+            sd = e.get("sentiment_delta")
+            rd = e.get("reply_delta")
+            is_significant = False
+            if sd is not None and abs(sd) >= 3:
+                is_significant = True
+            if rd is not None and abs(rd) >= 10:
+                is_significant = True
+            if is_significant:
+                significant_changes.append(e)
+
+        # 按热度排序
+        new_discoveries.sort(key=lambda x: x.get("heat_score", 0), reverse=True)
+        significant_changes.sort(key=lambda x: x.get("heat_score", 0), reverse=True)
+
+        report_date = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d")
+        await self.send_daily_card(new_discoveries, significant_changes, feishu, report_date, len(sync_list))
+
+        print(f"✅ 日报完成: 新发现={len(new_discoveries)}, 显著变化={len(significant_changes)}")
         await self.close()
 
-    def _sentiment_color(self, score):
-        if score >= 8.0:
-            return "red"
-        if score >= 5.0:
-            return "orange"
-        return "green"
-
-    def _template_by_sentiment(self, score):
-        if score >= 8.0:
-            return "red"
-        if score >= 5.0:
-            return "orange"
-        return "green"
-
-    async def send_weekly_card(self, st, fs, start_dt, total_suggestions):
-        top_sentiment = float(st[0]["avg_sentiment"]) if st else 5.0
-
+    # ==================== 日报卡片 ====================
+    async def send_daily_card(self, new_list, change_list, feishu, report_date, total_count):
         el = [{
             "tag": "markdown",
-            "content": (
-                "**📊 上周Discord建议热度榜**\n"
-                f"上周建议数量：**{total_suggestions}**"
-            )
-        }, {"tag": "hr"}]
+            "content": f"**📊 {report_date} Discord 建议日报**\n今日采集帖子：**{total_count}** 个"
+        }]
 
-        for i, item in enumerate(st):
-            score = float(item.get("avg_sentiment", 5.0))
-            score_color = self._sentiment_color(score)
-            summary = str(item.get("summary", "")).replace("\n", " ").strip()
-            summary = (summary[:88] + "...") if len(summary) > 88 else summary
-            short_title = str(item.get("short_title", "")).replace("\n", " ").strip()[:10]
-            short_summary = short_title or summary[:10]
+        def build_thread_element(item):
+            """构建单个帖子的卡片元素"""
+            sentiment = item.get("sentiment")
+            sd = item.get("sentiment_delta")
+            rd = item.get("reply_delta", 0)
 
-            if i == 0:
-                title_md = f"<font color='red'>**TOP 1 · {short_summary or item['topic']}**</font>"
+            # 颜色标记
+            if sentiment is not None and sentiment <= 3:
+                color = "red"
+            elif sd is not None and sd <= -3:
+                color = "red"
+            elif rd is not None and abs(rd) >= 10:
+                color = "orange"
+            elif sd is not None and sd >= 3:
+                color = "green"
             else:
-                title_md = f"**TOP {i+1} · {short_summary or item['topic']}**"
+                color = "grey"
 
-            tag_list = item.get("tag_list") or []
-            if not tag_list:
-                category = str(item.get("category", "未分类")).strip() or "未分类"
-                topic = str(item.get("topic", "未分类")).strip() or "未分类"
-                tag_list = [f"{category}-{topic}"]
-            cat_line = " ".join([f"#{t}" for t in tag_list[:4]])
+            # Δ 文案
+            if sd is not None:
+                sd_str = f"{'↑' if sd > 0 else '↓'}{abs(sd)}" if sd != 0 else "→0"
+            else:
+                sd_str = "new"
+            if rd is not None:
+                rd_str = f"+{rd}" if rd > 0 else str(rd)
+            else:
+                rd_str = "0"
 
-            el.append({
+            short_title = str(item.get("AI短标题", ""))[:10] or str(item.get("title", ""))[:10]
+            summary = str(item.get("AI核心总结", ""))[:60]
+            cat = str(item.get("模块分类", ""))
+            sub_cat = str(item.get("二级分类", ""))
+            tag = f"#{cat}-{sub_cat}" if cat and sub_cat else ""
+
+            return {
                 "tag": "column_set",
                 "columns": [
                     {
@@ -430,52 +1001,84 @@ class AdvancedBot(discord.Client):
                         "weight": 4,
                         "vertical_align": "top",
                         "elements": [
-                            {"tag": "markdown", "content": title_md},
-                            {"tag": "markdown", "content": f"{summary}"},
-                            {"tag": "note", "elements": [{"tag": "lark_md", "content": cat_line}]}
-                        ]
+                            {
+                                "tag": "markdown",
+                                "content": f"<font color='{color}'>**{short_title}**</font>"
+                            },
+                            {"tag": "markdown", "content": summary},
+                            {"tag": "note", "elements": [{"tag": "lark_md", "content": tag}]},
+                        ],
                     },
                     {
                         "tag": "column",
                         "width": "weighted",
                         "weight": 2,
                         "vertical_align": "top",
-                        "elements": [{
-                            "tag": "div",
-                            "fields": [
-                                {
-                                    "is_short": True,
-                                    "text": {"tag": "lark_md", "content": f"🔥 **总热度**\n{int(item['total_heat'])}"}
-                                },
-                                {
-                                    "is_short": True,
-                                    "text": {"tag": "lark_md", "content": f"🙂 **情绪分**\n<font color='{score_color}'>{score:.1f}</font>"}
-                                },
-                                {
-                                    "is_short": True,
-                                    "text": {"tag": "lark_md", "content": f"📝 **建议数**\n{int(item['thread_count'])}"}
-                                },
-                                {
-                                    "is_short": True,
-                                    "text": {"tag": "lark_md", "content": f"👥 **关注数**\n{int(item['user_count'])}"}
-                                }
-                            ]
-                        }]
-                    }
-                ]
-            })
-            if i < len(st) - 1:
-                el.append({"tag": "hr"})
+                        "elements": [
+                            {
+                                "tag": "div",
+                                "fields": [
+                                    {
+                                        "is_short": True,
+                                        "text": {"tag": "lark_md", "content": f"🙂 **满意度**\n<font color='{color}'>{sentiment if sentiment is not None else '-'}/10 ({sd_str})</font>"},
+                                    },
+                                    {
+                                        "is_short": True,
+                                        "text": {"tag": "lark_md", "content": f"💬 **回复数**\n{item.get('reply_count', 0)} ({rd_str})"},
+                                    },
+                                    {
+                                        "is_short": True,
+                                        "text": {"tag": "lark_md", "content": f"👥 **参与人数**\n{item.get('participant_count', 0)}"},
+                                    },
+                                    {
+                                        "is_short": True,
+                                        "text": {"tag": "lark_md", "content": f"🔥 **热度**\n{item.get('heat_score', 0)}"},
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            }
 
+        # 🆕 新发现
+        if new_list:
+            el.append({"tag": "hr"})
+            el.append({"tag": "markdown", "content": f"**🆕 新发现的帖子 ({len(new_list)})**"})
+            for i, item in enumerate(new_list[:10]):
+                el.append(build_thread_element(item))
+                if i < min(len(new_list), 10) - 1:
+                    el.append({"tag": "hr"})
+
+        # 📈 有显著变化
+        if change_list:
+            el.append({"tag": "hr"})
+            el.append({"tag": "markdown", "content": f"**📈 有显著变化的帖子 ({len(change_list)})**"})
+            for i, item in enumerate(change_list[:10]):
+                el.append(build_thread_element(item))
+                if i < min(len(change_list), 10) - 1:
+                    el.append({"tag": "hr"})
+
+        # 无内容
+        if not new_list and not change_list:
+            el.append({"tag": "hr"})
+            el.append({"tag": "markdown", "content": "今日暂无需要关注的新帖子或显著变化。"})
+
+        # 操作按钮
+        el.append({"tag": "hr"})
         el.append({
             "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"},
-                "type": "primary",
-                "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
-            }]
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"},
+                    "type": "primary",
+                    "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}",
+                }
+            ],
         })
+
+        # 指标说明
         el.append({"tag": "hr"})
         el.append({
             "tag": "note",
@@ -483,81 +1086,71 @@ class AdvancedBot(discord.Client):
                 {"tag": "plain_text", "content": "💡"},
                 {
                     "tag": "lark_md",
-                    "content": "指标说明：热度 = 消息×3 + 反应×1 ｜ 情绪分越高代表玩家越愤怒。"
-                }
-            ]
+                    "content": "指标说明：满意度 1-10（越高越满意） ｜ 热度 = 消息×1 + 反应×1 + 人数×3 ｜ Δ 满意度≥3 或 Δ 回复≥10 标记为显著变化",
+                },
+            ],
         })
+
+        # 确定卡片头部颜色
+        all_items = new_list + change_list
+        if all_items:
+            worst = min(item.get("sentiment", 5) for item in all_items if item.get("sentiment") is not None)
+            template = self._template_by_sentiment(worst)
+        else:
+            template = "blue"
+
         card_payload = {
             "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": f"🗓️ 上周Discord建议热度榜 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"
-                },
-                "template": self._template_by_sentiment(top_sentiment)
+                "title": {"tag": "plain_text", "content": f"🗓️ {report_date} Discord 建议日报"},
+                "template": template,
             },
-            "elements": el
+            "elements": el,
         }
-        ok = fs.send_group_card(card_payload)
-        if ok:
-            return
-
-        # 复杂布局不兼容时降级为简版卡片，保证消息可达
-        fallback_el = [{
-            "tag": "markdown",
-            "content": (
-                f"**📊 上周Discord建议热度榜**\n"
-                f"上周建议数量：{total_suggestions}"
-            )
-        }, {"tag": "hr"}]
-        for i, item in enumerate(st):
-            short_title = str(item.get("short_title", "")).replace("\n", " ").strip()[:10]
-            short_summary = short_title or str(item.get("summary", "")).replace("\n", " ").strip()[:10]
-            summary_90 = str(item.get("summary", "")).replace("\n", " ")[:90]
-            fallback_tag_list = item.get("tag_list") or []
-            if not fallback_tag_list:
-                fallback_category = str(item.get("category", "未分类")).strip() or "未分类"
-                fallback_topic = str(item.get("topic", "未分类")).strip() or "未分类"
-                fallback_tag_list = [f"{fallback_category}-{fallback_topic}"]
-            fallback_tag_line = " ".join([f"#{t}" for t in fallback_tag_list[:4]])
-            fallback_el.append({
-                "tag": "markdown",
-                "content": (
-                    f"**TOP {i+1}: {short_summary or item['topic']}**\n"
-                    f"{summary_90}\n"
-                    f"🔥 {int(item['total_heat'])} | 🙂 {float(item.get('avg_sentiment', 5.0)):.1f} | "
-                    f"📝 {int(item['thread_count'])} | 👥 {int(item['user_count'])} | "
-                    f"{fallback_tag_line}"
-                )
-            })
-        fallback_el.append({"tag": "action", "actions": [{
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"},
-            "type": "primary",
-            "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}"
-        }]})
-        fallback_el.append({"tag": "hr"})
-        fallback_el.append({
-            "tag": "note",
-            "elements": [
-                {"tag": "plain_text", "content": "💡"},
-                {
-                    "tag": "lark_md",
-                    "content": "指标说明：热度 = 消息×3 + 反应×1 ｜ 情绪分越高代表玩家越愤怒。"
-                }
+        ok = feishu.send_group_card(card_payload)
+        if not ok:
+            # 降级：简版卡片
+            fallback_el = [
+                {"tag": "markdown", "content": f"**📊 {report_date} Discord 建议日报**\n采集帖子：{total_count}"},
+                {"tag": "hr"},
             ]
-        })
-        fs.send_group_card({
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": f"🗓️ 上周Discord建议热度榜 ({start_dt.strftime('%m/%d')}-{(start_dt + timedelta(days=6)).strftime('%m/%d')})"
+            for item in (new_list + change_list)[:10]:
+                short = str(item.get("AI短标题", item.get("title", "")))[:10]
+                s = item.get("sentiment", "-")
+                summary = str(item.get("AI核心总结", ""))[:60]
+                fallback_el.append({
+                    "tag": "markdown",
+                    "content": f"**{short}** | 🙂{s}/10 | 🔥{item.get('heat_score', 0)}\n{summary}",
+                })
+            fallback_el.append({"tag": "action", "actions": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔍 查看多维表格详情"},
+                "type": "primary",
+                "url": f"https://feishu.cn/base/{CONF['BITABLE_TOKEN']}",
+            }]})
+            feishu.send_group_card({
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"🗓️ {report_date} Discord 建议日报"},
+                    "template": "blue",
                 },
-                "template": "blue"
-            },
-            "elements": fallback_el
-        })
+                "elements": fallback_el,
+            })
 
+
+# ===================== 5. 辅助函数 =====================
+async def t_fetch_messages(thread, limit=10):
+    """获取 thread 内前 N 条消息（按时间正序）"""
+    messages = []
+    try:
+        async for m in thread.history(limit=limit, oldest_first=True):
+            messages.append(m)
+    except Exception:
+        pass
+    return messages
+
+
+# ===================== 6. 入口 =====================
 if __name__ == "__main__":
     intents = discord.Intents.default()
-    intents.message_content, intents.guilds = True, True
-    AdvancedBot(intents=intents).run(CONF["DISCORD_TOKEN"])
+    intents.message_content = True
+    intents.guilds = True
+    DailyBot(intents=intents).run(CONF["DISCORD_TOKEN"])
