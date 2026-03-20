@@ -433,8 +433,14 @@ class DailyBot(discord.Client):
             content_preview = t.get("first_content", "")[:100]
             lines.append(f"[{t['thread_id']}] {t['title']} | {content_preview}")
         prompt = (
-            "你是 DarkWar 游戏的策划分析师。判断以下帖子是否包含对策划有价值的真实玩家反馈（需求/建议/bug/情绪表达）。\n"
-            "排除：测试帖、闲聊、水帖、纯表情、无意义内容。\n"
+            "你是 DarkWar 游戏的社区分析师。判断以下帖子是否值得策划团队关注。\n"
+            "放行标准（满足任一即 yes）：\n"
+            "- 玩家直接反馈问题/建议/bug\n"
+            "- 玩家对游戏机制、平衡性、赛季的讨论或吐槽\n"
+            "- 玩家情绪强烈（不满/兴奋/失望）\n"
+            "- 回复数多或参与人数多的热门讨论\n"
+            "排除（no）：纯水帖、纯表情、无意义内容、与游戏无关闲聊。\n"
+            "宁可多放行，不要漏掉有价值的讨论。\n"
             "对每个帖子回复一行：thread_id|yes/no|一句话理由\n"
             "帖子列表：\n" + "\n".join(lines)
         )
