@@ -1,7 +1,7 @@
-name: Manual Test Discord Report
+name: Daily Discord Report
 
 on:
-  workflow_dispatch: # 这个配置允许你在网页上点击按钮立即运行
+  workflow_dispatch:
     inputs:
       send_mode:
         description: "发送模式：test 发个人，prod 发群"
@@ -12,8 +12,7 @@ on:
           - test
           - prod
   schedule:
-    - cron: '0 2 * * 5' # 每周五北京时间上午 10:00 (UTC 2:00) 正常执行
-    - cron: '30 2 * * 5' # 每周五北京时间上午 10:30 (UTC 2:30) 补偿检查
+    - cron: '0 2 * * *' # 每天北京时间上午 10:00 (UTC 2:00)
 
 permissions:
   contents: read
@@ -34,64 +33,15 @@ jobs:
       - name: Install Dependencies
         run: pip install discord.py openai requests python-dotenv
 
-      - name: Decide whether to run report on 10:30 fallback
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_WORKFLOW: ${{ github.workflow }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          TRIGGER_CRON: ${{ github.event.schedule }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          should_run=true
-
-          # 10:00 正常任务始终执行；只在 10:30 做“是否需要补跑”的判断
-          if [ "$TRIGGER_CRON" = "30 2 * * 5" ]; then
-            today="$(date -u +%Y-%m-%d)"
-            runs_json="$(curl -sS \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/test_report.yml/runs?event=schedule&branch=$DEFAULT_BRANCH&per_page=50")"
-
-            count_10am="$(RUNS_JSON="$runs_json" python - <<'PY'
-          import datetime as dt
-          import json
-          import os
-
-          data = json.loads(os.environ.get("RUNS_JSON", "{}"))
-          today = dt.datetime.now(dt.timezone.utc).date()
-          cur_id = str(os.environ.get("GITHUB_RUN_ID", ""))
-
-          count = 0
-          for run in data.get("workflow_runs", []):
-              if str(run.get("id")) == cur_id:
-                  continue
-              created = run.get("created_at")
-              if not created:
-                  continue
-              t = dt.datetime.fromisoformat(created.replace("Z", "+00:00"))
-              # 仅统计“今天 UTC 2点整触发窗口”的 schedule 记录，避免把 10:30 自己算进去
-              if t.date() == today and t.hour == 2 and t.minute < 20:
-                  count += 1
-          print(count)
-          PY
-          )"
-
-            if [ "$count_10am" -gt 0 ]; then
-              echo "10:00 的 schedule 已有执行记录，本次 10:30 跳过补跑。"
-              should_run=false
-            else
-              echo "10:00 的 schedule 没有执行记录，本次 10:30 触发补跑。"
-            fi
-          fi
-
-          echo "SHOULD_RUN=$should_run" >> "$GITHUB_ENV"
+      - name: Restore SQLite DB from Artifact
+        uses: actions/cache@v4
+        with:
+          path: threads.db
+          key: discord-threads-db-${{ github.ref_name }}
+          restore-keys: |
+            discord-threads-db-
 
       - name: Validate Test Target
-        if: env.SHOULD_RUN != 'false'
         env:
           FEISHU_SEND_MODE: ${{ github.event_name == 'schedule' && 'prod' || github.event.inputs.send_mode }}
           FEISHU_TEST_RECEIVE_ID: ${{ secrets.FEISHU_TEST_RECEIVE_ID }}
@@ -101,24 +51,27 @@ jobs:
             exit 1
           fi
 
-
       - name: Run Script
-        if: env.SHOULD_RUN != 'false'
         env:
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
-          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}      
-          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }} 
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_BITABLE_APP_TOKEN: ${{ secrets.FEISHU_BITABLE_APP_TOKEN }}
           FEISHU_BITABLE_TABLE_ID: ${{ secrets.FEISHU_BITABLE_TABLE_ID }}
           FEISHU_REFERENCE_TABLE_ID: ${{ secrets.FEISHU_REFERENCE_TABLE_ID }}
           FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
-          # schedule 固定发群；手动触发可在页面选择 test/prod
           FEISHU_SEND_MODE: ${{ github.event_name == 'schedule' && 'prod' || github.event.inputs.send_mode }}
-          # 测试发送到个人时使用（建议配置 open_id）
           FEISHU_TEST_RECEIVE_ID: ${{ secrets.FEISHU_TEST_RECEIVE_ID }}
           FEISHU_TEST_RECEIVE_ID_TYPE: ${{ secrets.FEISHU_TEST_RECEIVE_ID_TYPE }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
         run: python discord_weekly_report.py
+
+      - name: Save SQLite DB to Artifact
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: threads.db
+          key: discord-threads-db-${{ github.ref_name }}
