@@ -822,8 +822,8 @@ class DailyBot(discord.Client):
             old_sentiment = t.get("prev_sentiment", 5) or 5
             old_category = t.get("old_category", "其他") or "其他"
             old_sub_category = t.get("old_sub_category", "通用") or "通用"
-            old_summary = t.get("old_summary", "") or ""
-            old_short_title = t.get("old_short_title", "") or ""
+            old_summary = t.get("old_summary", "") or t.get("first_content", "")[:50] or ""
+            old_short_title = t.get("old_short_title", "") or t.get("title", "")[:10] or ""
             heat = self._calc_heat(
                 t.get("message_count", 1),
                 t.get("total_reactions", 0),
