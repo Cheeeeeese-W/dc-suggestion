@@ -427,7 +427,7 @@ class DailyBot(discord.Client):
             return set()
         lines = []
         for t in thread_list:
-            content_preview = t.get("first_content", "")[:100]
+            content_preview = t.get("first_content", "")[:50]
             lines.append(f"[{t['thread_id']}] {t['title']} | {content_preview}")
         prompt = (
             "你是 DarkWar 游戏的社区分析助手。你的任务是**筛掉垃圾帖**，不是找精品帖。\n"
