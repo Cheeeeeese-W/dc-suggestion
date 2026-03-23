@@ -16,7 +16,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
   run-report:
@@ -32,13 +31,6 @@ jobs:
 
       - name: Install Dependencies
         run: pip install discord.py openai requests python-dotenv
-
-      - name: Restore SQLite DB from Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: discord-threads-db
-          path: .
-        continue-on-error: true
 
       - name: Validate Test Target
         env:
@@ -67,11 +59,3 @@ jobs:
           FEISHU_TEST_RECEIVE_ID_TYPE: ${{ secrets.FEISHU_TEST_RECEIVE_ID_TYPE }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
         run: python discord_weekly_report.py
-
-      - name: Save SQLite DB to Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: discord-threads-db
-          path: threads.db
-          overwrite: true

@@ -4,7 +4,7 @@ Discord 社区监控工具 V2 — 日报升级
 
 V2 改动：
 - 调度改为每日（去掉 10:30 补偿检查）
-- SQLite 持久化 threads.db + GitHub Actions artifact
+- 飞书多维表格（Bitable）作为唯一数据源，帖子去重 + 增量判断
 - 拉取范围：活跃帖子 + 归档帖子，thread_id 去重
 - 三层过滤漏斗：规则过滤 → AI 预筛 → 深度分析
 - 增量分析：reply_count 变化才重新分析，silent_days >= 3 跳过
@@ -18,7 +18,6 @@ V2 改动：
 import asyncio
 import os
 import json
-import sqlite3
 import re
 import discord
 import requests
@@ -45,116 +44,11 @@ def get_conf():
         "FEISHU_SEND_MODE": os.getenv("FEISHU_SEND_MODE", "prod"),
         "FEISHU_TEST_RECEIVE_ID": os.getenv("FEISHU_TEST_RECEIVE_ID"),
         "FEISHU_TEST_RECEIVE_ID_TYPE": os.getenv("FEISHU_TEST_RECEIVE_ID_TYPE", "open_id"),
-        "DB_PATH": os.getenv("DB_PATH", "threads.db"),
     }
 
 CONF = get_conf()
 
-# ===================== 2. SQLite 数据库 =====================
-DB_PATH = CONF["DB_PATH"]
-
-def init_db():
-    """初始化数据库（幂等）"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS threads (
-            thread_id TEXT PRIMARY KEY,
-            title TEXT,
-            channel_id TEXT,
-            author_name TEXT,
-            author_id TEXT,
-            created_at TEXT,
-            first_seen_at TEXT,
-            last_updated_at TEXT,
-            is_archived INTEGER DEFAULT 0,
-            category TEXT,
-            sub_category TEXT,
-            summary TEXT,
-            short_title TEXT,
-            sentiment INTEGER,
-            prev_sentiment INTEGER,
-            reply_count INTEGER,
-            prev_reply_count INTEGER,
-            participant_count INTEGER,
-            prev_participant_count INTEGER,
-            heat_score INTEGER,
-            heat_trend TEXT,
-            silent_days INTEGER DEFAULT 0,
-            hot_flag INTEGER DEFAULT 0,
-            filtered INTEGER DEFAULT 0,
-            record_id TEXT
-        )
-    """)
-    # 兼容旧库：若缺少 record_id 列则自动添加
-    try:
-        c.execute("ALTER TABLE threads ADD COLUMN record_id TEXT")
-    except sqlite3.OperationalError:
-        pass
-    conn.commit()
-    conn.close()
-
-
-def get_thread(tid):
-    """获取单条帖子记录"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM threads WHERE thread_id = ?", (tid,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-
-def save_thread(data):
-    """插入或更新帖子记录"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO threads (thread_id, title, channel_id, author_name, author_id,
-            created_at, first_seen_at, last_updated_at, is_archived,
-            category, sub_category, summary, short_title,
-            sentiment, prev_sentiment,
-            reply_count, prev_reply_count,
-            participant_count, prev_participant_count,
-            heat_score, heat_trend, silent_days, hot_flag, filtered, record_id)
-        VALUES (:thread_id, :title, :channel_id, :author_name, :author_id,
-            :created_at, :first_seen_at, :last_updated_at, :is_archived,
-            :category, :sub_category, :summary, :short_title,
-            :sentiment, :prev_sentiment,
-            :reply_count, :prev_reply_count,
-            :participant_count, :prev_participant_count,
-            :heat_score, :heat_trend, :silent_days, :hot_flag, :filtered, :record_id)
-        ON CONFLICT(thread_id) DO UPDATE SET
-            title=excluded.title, channel_id=excluded.channel_id,
-            author_name=excluded.author_name, author_id=excluded.author_id,
-            last_updated_at=excluded.last_updated_at, is_archived=excluded.is_archived,
-            category=excluded.category, sub_category=excluded.sub_category,
-            summary=excluded.summary, short_title=excluded.short_title,
-            sentiment=excluded.sentiment, prev_sentiment=excluded.prev_sentiment,
-            reply_count=excluded.reply_count, prev_reply_count=excluded.prev_reply_count,
-            participant_count=excluded.participant_count,
-            prev_participant_count=excluded.prev_participant_count,
-            heat_score=excluded.heat_score, heat_trend=excluded.heat_trend,
-            silent_days=excluded.silent_days, hot_flag=excluded.hot_flag,
-            filtered=excluded.filtered, record_id=excluded.record_id
-    """, data)
-    conn.commit()
-    conn.close()
-
-
-def update_record_ids(thread_id_to_record_id: dict):
-    """批量更新 record_id（Bitable 同步后回写）"""
-    if not thread_id_to_record_id:
-        return
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    for tid, rid in thread_id_to_record_id.items():
-        c.execute("UPDATE threads SET record_id = ? WHERE thread_id = ?", (rid, tid))
-    conn.commit()
-    conn.close()
-
-
-# ===================== 3. 飞书 API 客户端 =====================
+# ===================== 2. 飞书 API 客户端 =====================
 class FeishuClient:
     def __init__(self):
         self.token = self._get_tenant_access_token()
@@ -221,7 +115,8 @@ class FeishuClient:
     def query_bitable_existing(self) -> dict:
         """
         查询主表中所有已有记录，从帖子链接提取 thread_id。
-        返回 {thread_id: record_id}
+        返回 {thread_id: {record_id, reply_count, sentiment, participant_count,
+                          heat_score, category, sub_category, summary, short_title}}
         """
         if not self.token:
             return {}
@@ -241,7 +136,26 @@ class FeishuClient:
                     link = fields.get("帖子链接")
                     tid = self._extract_thread_id_from_url(link)
                     if tid:
-                        result[tid] = item["record_id"]
+                        # 解析数字字段，兼容飞书返回的 int/float/str
+                        def _parse_int(val, default=0):
+                            if val is None:
+                                return default
+                            try:
+                                return int(float(val))
+                            except (ValueError, TypeError):
+                                return default
+
+                        result[tid] = {
+                            "record_id": item["record_id"],
+                            "reply_count": _parse_int(fields.get("回复数"), 0),
+                            "sentiment": _parse_int(fields.get("满意度"), None) if fields.get("满意度") is not None else None,
+                            "participant_count": _parse_int(fields.get("参与人数"), 1),
+                            "heat_score": _parse_int(fields.get("热度分"), 0),
+                            "category": str(fields.get("模块分类", "")),
+                            "sub_category": str(fields.get("二级分类", "")),
+                            "summary": str(fields.get("AI核心总结", "")),
+                            "short_title": str(fields.get("AI短标题", "")),
+                        }
                 if not data.get("has_more"):
                     break
                 page_token = data.get("page_token")
@@ -251,18 +165,19 @@ class FeishuClient:
         print(f"📋 Bitable 已有记录: {len(result)} 条")
         return result
 
-    def sync_bitable(self, enriched_list: list):
+    def sync_bitable(self, enriched_list: list, existing: dict = None):
         """
         同步数据到飞书多维表格。
         - 新帖子（Bitable 中无记录）→ batch_create
         - 旧帖子（Bitable 中有记录）→ batch_update
-        返回 {thread_id: record_id} 映射，用于回写 SQLite。
+        返回 {thread_id: record_id} 映射。
         """
         if not self.token or not enriched_list:
             return {}
 
-        # 1) 查询 Bitable 中已有记录（从帖子链接提取 thread_id）
-        existing = self.query_bitable_existing()
+        # 1) 查询 Bitable 中已有记录（复用外部传入的 existing 或重新查询）
+        if existing is None:
+            existing = self.query_bitable_existing()
 
         # 2) 分组：新增 vs 更新
         new_records = []
@@ -292,11 +207,9 @@ class FeishuClient:
 
             if tid in existing:
                 fields["状态"] = "有变化"
-                update_records.append({"record_id": existing[tid], "fields": fields})
+                update_records.append({"record_id": existing[tid]["record_id"], "fields": fields})
             else:
                 new_records.append({"fields": fields})
-
-        result = dict(existing)  # 保留已有映射
 
         # 3) batch_create（每批 500 条）
         if new_records:
@@ -330,8 +243,6 @@ class FeishuClient:
                         print(f"❌ Bitable batch_update 失败: {resp.get('msg')}")
                 except Exception as e:
                     print(f"❌ Bitable batch_update 异常: {e}")
-
-        return result
 
     # ---- 发送卡片 ----
     def send_group_card(self, card_content):
@@ -503,8 +414,8 @@ class DailyBot(discord.Client):
         feishu = FeishuClient()
         ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=CONF["AI_BASE_URL"].strip().rstrip("/") + "/v1")
 
-        # 0. 初始化数据库
-        init_db()
+        # 0. 从 Bitable 加载已有记录（去重 + 增量判断的数据源）
+        bitable_existing = feishu.query_bitable_existing()
 
         # 1. 加载术语参考库
         kb = feishu.get_knowledge_base()
@@ -622,34 +533,30 @@ class DailyBot(discord.Client):
         if not candidates:
             print("📭 无候选帖子进入深度分析")
 
-        # 5. 增量判断：哪些帖子需要深度分析
+        # 5. 增量判断：哪些帖子需要深度分析（数据源：Bitable）
         now_str = datetime.now(timezone.utc).isoformat()
         need_analysis = []
         skip_analysis = []
 
         for t in candidates:
-            existing = get_thread(t["thread_id"])
+            existing = bitable_existing.get(t["thread_id"])
             if existing:
-                # existing: (thread_id, title, channel_id, author_name, author_id,
-                #   created_at, first_seen_at, last_updated_at, is_archived,
-                #   category, sub_category, summary, short_title,
-                #   sentiment, prev_sentiment, reply_count, prev_reply_count,
-                #   participant_count, prev_participant_count,
-                #   heat_score, heat_trend, silent_days, hot_flag, filtered, record_id)
-                old_reply_count = existing[16] or 0  # reply_count
-                old_sentiment = existing[13]     # sentiment
-                old_silent_days = existing[21] or 0   # silent_days
+                # existing: {record_id, reply_count, sentiment, participant_count,
+                #            heat_score, category, sub_category, summary, short_title}
+                old_reply_count = existing.get("reply_count") or 0
+                old_sentiment = existing.get("sentiment")
+                old_silent_days = 0  # Bitable 中暂无 silent_days 字段，默认 0
 
                 # 保存旧值用于后续计算
                 t["prev_reply_count"] = old_reply_count
                 t["prev_sentiment"] = old_sentiment
-                t["old_category"] = existing[9]
-                t["old_sub_category"] = existing[10]
-                t["old_summary"] = existing[11]
-                t["old_short_title"] = existing[12]
-                t["old_participant_count"] = existing[17]
-                t["old_heat_score"] = existing[19]
-                t["record_id"] = existing[24]
+                t["old_category"] = existing.get("category", "")
+                t["old_sub_category"] = existing.get("sub_category", "")
+                t["old_summary"] = existing.get("summary", "")
+                t["old_short_title"] = existing.get("short_title", "")
+                t["old_participant_count"] = existing.get("participant_count", 0)
+                t["old_heat_score"] = existing.get("heat_score", 0)
+                t["record_id"] = existing.get("record_id")
                 t["is_new"] = False
 
                 if old_silent_days >= 3:
@@ -895,48 +802,16 @@ class DailyBot(discord.Client):
             else:
                 e["silent_days"] = 0
 
-        # 10. 保存到 SQLite
-        for e in everything:
-            save_thread({
-                "thread_id": e["thread_id"],
-                "title": e.get("title", ""),
-                "channel_id": str(CONF["CHANNEL_ID"]),
-                "author_name": e.get("author_name", ""),
-                "author_id": e.get("author_id", ""),
-                "created_at": e["created_at"].isoformat() if isinstance(e.get("created_at"), datetime) else str(e.get("created_at", "")),
-                "first_seen_at": e["created_at"].isoformat() if e.get("is_new") and isinstance(e.get("created_at"), datetime) else None,
-                "last_updated_at": now_str,
-                "is_archived": 1 if e.get("is_archived") else 0,
-                "category": e.get("模块分类", ""),
-                "sub_category": e.get("二级分类", ""),
-                "summary": e.get("AI核心总结", ""),
-                "short_title": e.get("AI短标题", ""),
-                "sentiment": e.get("sentiment"),
-                "prev_sentiment": e.get("prev_sentiment"),
-                "reply_count": e.get("reply_count", 0),
-                "prev_reply_count": e.get("prev_reply_count"),
-                "participant_count": e.get("participant_count", 0),
-                "prev_participant_count": e.get("old_participant_count"),
-                "heat_score": e.get("heat_score", 0),
-                "heat_trend": e.get("heat_trend", "stable"),
-                "silent_days": e.get("silent_days", 0),
-                "hot_flag": 1 if (e.get("heat_score", 0) > 50 and not e.get("filtered")) else 0,
-                "filtered": 1 if e.get("filtered") else 0,
-                "record_id": e.get("record_id"),
-            })
-
-        # 11. 飞书多维表格同步
+        # 10. 飞书多维表格同步（数据源：Bitable，无需本地 DB）
         sync_list = [e for e in everything if not e.get("filtered")]
         for e in sync_list:
             e["date_ms"] = int(e["created_at"].timestamp() * 1000) if isinstance(e.get("created_at"), datetime) else 0
-        record_id_map = feishu.sync_bitable(sync_list)
-        if record_id_map:
-            update_record_ids(record_id_map)
+        feishu.sync_bitable(sync_list, existing=bitable_existing)
 
-        # 12. 更新参考库
+        # 11. 更新参考库
         feishu.add_new_reference(list(new_kb_records))
 
-        # 13. 发送日报卡片
+        # 12. 发送日报卡片
         # 分类：新发现 vs 有显著变化
         new_discoveries = [e for e in all_enriched if e.get("is_new") and not e.get("filtered")]
         significant_changes = []
