@@ -642,13 +642,13 @@ class DailyBot(discord.Client):
 【输出要求】：
 1. 输出必须为简体中文的 JSON 数组
 2. category 和 sub_category 只输出单个最合适的分类（不要列表）
-3. suggestion_core 必须是具体可执行的建议（如"将X技能眩晕从3秒降至1.5秒"），而非笼统描述
-4. summary 是对建议的一句话精炼总结
+3. summary 概括帖子讨论的核心问题是什么（只描述问题，不要写建议）
+4. suggestion_core 是玩家提出的具体改进方案，可以有多条用分号分隔（如"将X技能眩晕从3秒降至1.5秒；增加眩晕递减机制"）。如果帖子只描述了问题但没有提出建议，填"无"
 5. short_title 必须是 10 字以内的中文短标题
 6. sentiment 为 1-10 分，分数越高代表玩家越满意（10 最满意，1 最愤怒）
    - 1-2：极度不满  3-4：明显不满  5-6：中性  7-8：比较满意  9-10：非常满意
 
-输出字段: id, category, sub_category, suggestion_core(具体可执行建议), summary, short_title(10字以内), sentiment(1-10), is_new_category(布尔值,可选)
+输出字段: id, category, sub_category, summary(核心问题概括), suggestion_core(具体改进方案或"无"), short_title(10字以内), sentiment(1-10), is_new_category(布尔值,可选)
 数据：
 {chr(10).join(items_for_ai)}"""
 
@@ -721,7 +721,7 @@ class DailyBot(discord.Client):
                         "模块分类": c1,
                         "二级分类": c2,
                         "sentiment": sentiment,
-                        "具体建议": str(ai_info.get("suggestion_core") or ai_info.get("summary", t["title"])),
+                        "具体建议": str(ai_info.get("suggestion_core", "无")),
                         "AI短标题": str(ai_info.get("short_title") or ai_info.get("summary", t["title"]))[:10],
                         "AI核心总结": str(ai_info.get("summary", t["title"])),
                         "heat_score": heat,
