@@ -186,10 +186,13 @@ class FeishuClient:
             tid = str(e["thread_id"])
             fields = {
                 "日期": e.get("date_ms"),
+                "帖子标题": str(e.get("title", ""))[:100],
                 "模块分类": e.get("模块分类"),
                 "二级分类": e.get("二级分类"),
+                "具体建议": str(e.get("具体建议", "")),
+                "AI短标题": str(e.get("AI短标题", ""))[:10],
                 "热度分": int(e.get("heat_score", 0)),
-                "参与人数": int(e.get("参与人数", 1)),
+                "参与人数": int(e.get("participant_count", 1)),
                 "AI核心总结": str(e.get("AI核心总结", "")),
                 "满意度": int(e.get("sentiment", 5)) if e.get("sentiment") is not None else 5,
                 "回复数": int(e.get("reply_count", 0)),
@@ -292,19 +295,22 @@ class DailyBot(discord.Client):
         negative = 0
         for r in (getattr(msg, "reactions", None) or []):
             cnt = int(getattr(r, "count", 0) or 0)
-            emoji_raw = str(getattr(r, "emoji", "")).lower()
-            emoji_name = str(getattr(getattr(r, "emoji", None), "name", "")).lower()
-            token = f"{emoji_raw} {emoji_name}"
-            if ("👎" in token) or ("thumbsdown" in token) or ("thumb_down" in token) or ("downvote" in token) or ("-1" in token):
+            emoji_obj = getattr(r, "emoji", None)
+            emoji_raw = str(emoji_obj).lower() if emoji_obj else ""
+            emoji_name = str(getattr(emoji_obj, "name", "")).lower()
+
+            # 负向：精确匹配，避免 "-1" 误匹配 "stage-1" 等
+            if "👎" in emoji_raw or emoji_name in ("thumbsdown", "thumb_down", "downvote", "-1", "minus_one"):
                 negative += cnt
                 continue
-            if ("👍" in token) or ("thumbsup" in token) or ("thumb_up" in token) or ("upvote" in token) or ("+1" in token):
+            # 正向：精确匹配
+            if "👍" in emoji_raw or emoji_name in ("thumbsup", "thumb_up", "upvote", "+1", "plus_one"):
                 positive += cnt
                 continue
-            if ("💯" in token) or (":100:" in token) or ("100" == emoji_name):
+            if "💯" in emoji_raw or emoji_name == "100":
                 positive += cnt
                 continue
-            if ("up" == emoji_name) or ("_up" in emoji_name) or ("up_" in emoji_name):
+            if emoji_name == "up" or emoji_name.startswith("up_") or emoji_name.endswith("_up"):
                 positive += cnt
                 continue
         return positive, negative
@@ -401,18 +407,17 @@ class DailyBot(discord.Client):
         return "green"
 
     def _template_by_sentiment(self, score):
-        if score <= 3:
-            return "red"
-        if score <= 5:
-            return "orange"
-        return "green"
+        return self._sentiment_color(score)
 
     # ==================== 主流程 ====================
     async def on_ready(self):
         print(f"🚀 V2 日报系统就绪: {self.user}")
         channel = self.get_channel(CONF["CHANNEL_ID"])
         feishu = FeishuClient()
-        ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=CONF["AI_BASE_URL"].strip().rstrip("/") + "/v1")
+        base_url = CONF["AI_BASE_URL"].strip().rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url += "/v1"
+        ai_client = AsyncOpenAI(api_key=CONF["AI_API_KEY"], base_url=base_url)
 
         # 0. 从 Bitable 加载已有记录（去重 + 增量判断的数据源）
         bitable_existing = feishu.query_bitable_existing()
@@ -483,12 +488,31 @@ class DailyBot(discord.Client):
                 pos_reactions, neg_reactions = self._reaction_polarity_counts(msg)
                 total_reactions = sum(r.count for r in (msg.reactions or []))
 
+                # 采集前 10 条非 bot 消息 + 统计真实参与人数
+                msg_texts = []
+                real_participants = set()
+                try:
+                    async for m in t.history(limit=20, oldest_first=True):
+                        if getattr(m.author, "bot", False):
+                            continue
+                        real_participants.add(m.author.id)
+                        text = str(m.content or "")[:200].strip()
+                        if text and len(msg_texts) < 10:
+                            msg_texts.append(text)
+                except Exception:
+                    if first_content:
+                        msg_texts = [first_content[:200]]
+                if msg.author:
+                    real_participants.add(msg.author.id)
+                real_participant_count = max(1, len(real_participants))
+
                 thread_data = {
                     "thread_id": tid,
                     "title": t.name,
                     "first_content": first_content,
+                    "msg_texts": msg_texts,
                     "reply_count": reply_count,
-                    "participant_count": participant_count,
+                    "participant_count": real_participant_count,
                     "pos_reactions": pos_reactions,
                     "neg_reactions": neg_reactions,
                     "total_reactions": total_reactions,
@@ -586,48 +610,48 @@ class DailyBot(discord.Client):
         new_kb_records = set()
 
         if need_analysis:
-            # 构造 AI 上下文：每帖取前 10 条消息（跳过 bot），每条截前 200 字符
+            # 构造 AI 上下文：使用采集阶段预收集的 msg_texts
             items_for_ai = []
             for t in need_analysis:
-                # 获取前 10 条非 bot 消息
-                msg_texts = []
-                try:
-                    async for m in t_fetch_messages(t, 10):
-                        if getattr(m.author, "bot", False):
-                            continue
-                        text = str(m.content or "")[:200]
-                        if text.strip():
-                            msg_texts.append(text)
-                except Exception:
-                    if t.get("first_content"):
-                        msg_texts.append(t["first_content"][:200])
-
+                msg_texts = t.get("msg_texts") or []
+                if not msg_texts and t.get("first_content"):
+                    msg_texts = [t["first_content"][:200]]
                 msg_block = "\n".join(msg_texts) if msg_texts else t.get("first_content", "")[:200]
                 items_for_ai.append(
                     f"ID: {t['thread_id']} | 标题: {t['title']} | 消息:\n{msg_block}"
                 )
 
-            ref_guide = "\n".join([f"- {e['cat1']} | {e['cat2']} (关键字: {','.join(e['keywords'])})" for e in kb])
+            # 构造分类选项列表（按 cat1 分组展示）
+            cat_options = {}
+            for e in kb:
+                cat_options.setdefault(e["cat1"], set()).add(e["cat2"])
+            ref_guide = "\n".join([f"- {c1} > {' | '.join(sorted(c2s))}" for c1, c2s in cat_options.items()])
 
-            prompt = f"""分析《DarkWar》玩家建议并输出 JSON []。
+            prompt = f"""分析《DarkWar》玩家建议帖，按以下步骤处理每个帖子：
 
-【分类参考库】：
-{ref_guide if ref_guide else "暂无，请根据内容自创规范的中文分类"}
+第1步 - 理解：玩家核心诉求是什么？
+第2步 - 分类：从分类选项中选择最匹配的分类
+第3步 - 提炼：用一句话写出具体可执行的建议
 
-【要求】：
-1. 输出必须为简体中文。
-2. category 和 sub_category 只输出单个最合适的分类（不要列表）。
-3. summary 必须是对建议的一句话精炼总结。
-4. short_title 必须是 10 字以内的中文短标题，用于卡片展示。
-5. sentiment 为 1-10 分，分数越高代表玩家越满意（10 最满意，1 最愤怒）。
-   - 1-2：极度不满（暴怒、威胁退游）
-   - 3-4：明显不满（强烈吐槽）
-   - 5-6：中性（混合反馈）
-   - 7-8：比较满意（认可但有建议）
-   - 9-10：非常满意（赞扬）
+【分类规则】：
+1. 优先从以下已有分类中选择：
+{ref_guide if ref_guide else "暂无已有分类"}
+2. 如果确实无法匹配任何已有分类，可以创建新分类，但必须设置 is_new_category: true
+3. 新分类命名要求：简体中文，2-6字，不要过于具体
+4. 无法判断时使用 category="其他", sub_category="待分类"
 
-输出字段: id, sentiment(1-10), category(单个字符串), sub_category(单个字符串), short_title(10字以内), summary(中文)。
-数据：\n{chr(10).join(items_for_ai)}"""
+【输出要求】：
+1. 输出必须为简体中文的 JSON 数组
+2. category 和 sub_category 只输出单个最合适的分类（不要列表）
+3. suggestion_core 必须是具体可执行的建议（如"将X技能眩晕从3秒降至1.5秒"），而非笼统描述
+4. summary 是对建议的一句话精炼总结
+5. short_title 必须是 10 字以内的中文短标题
+6. sentiment 为 1-10 分，分数越高代表玩家越满意（10 最满意，1 最愤怒）
+   - 1-2：极度不满  3-4：明显不满  5-6：中性  7-8：比较满意  9-10：非常满意
+
+输出字段: id, category, sub_category, suggestion_core(具体可执行建议), summary, short_title(10字以内), sentiment(1-10), is_new_category(布尔值,可选)
+数据：
+{chr(10).join(items_for_ai)}"""
 
             try:
                 print(f"🤖 第三层深度分析中 ({len(need_analysis)} 帖)...")
@@ -648,42 +672,42 @@ class DailyBot(discord.Client):
 
                 ai_map = {item["id"]: item for item in ai_res if isinstance(item, dict)}
 
+                # 构建参考表查找集合
+                kb_pairs = {(e["cat1"], e["cat2"]) for e in kb}
+
+                def _to_str(v, d):
+                    if isinstance(v, list):
+                        return str(v[0]).strip()[:20] if v else d
+                    return str(v).strip()[:20] if v else d
+
                 for t in need_analysis:
                     ai_info = ai_map.get(t["thread_id"], {})
 
-                    def to_l(v, d):
-                        return [str(i).strip()[:20] for i in (v if isinstance(v, list) else [v] if v else [d])]
+                    ai_cat1 = _to_str(ai_info.get("category"), "其他")
+                    ai_cat2 = _to_str(ai_info.get("sub_category"), "通用")
 
-                    ai_c1 = to_l(ai_info.get("category"), "其他")
-                    ai_c2 = to_l(ai_info.get("sub_category"), "通用")
-
-                    label_text = (" ".join(ai_c1) + " " + " ".join(ai_c2) + " " + str(ai_info.get("summary", ""))).upper()
-
-                    pair_scores = {}
-                    for entry in kb:
-                        pair = (entry["cat1"], entry["cat2"])
-                        score = 0
-                        for kw in entry["keywords"]:
-                            kw = (kw or "").strip()
-                            if not kw:
-                                continue
-                            if kw.upper() in label_text:
-                                score += 3
-                        if entry["cat1"] in ai_c1:
-                            score += 2
-                        if entry["cat2"] in ai_c2:
-                            score += 4
-                        if score > 0:
-                            pair_scores[pair] = pair_scores.get(pair, 0) + score
-
-                    if pair_scores:
-                        best_pair = sorted(pair_scores.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))[0][0]
-                        c1, c2 = best_pair[0], best_pair[1]
+                    # 精确匹配参考表
+                    if (ai_cat1, ai_cat2) in kb_pairs:
+                        c1, c2 = ai_cat1, ai_cat2
                     else:
-                        c1, c2 = ai_c1[0], ai_c2[0]
-                        if c1 not in ("其他", "", None) and c2 not in ("通用", "", None):
-                            if not any(e["cat1"] == c1 and e["cat2"] == c2 for e in kb):
-                                new_kb_records.add((c1, c2))
+                        # 没有精确匹配，尝试同 cat1 下的近似 cat2
+                        matched = False
+                        for entry in kb:
+                            if entry["cat1"] == ai_cat1:
+                                # 简单字符重叠比较
+                                overlap = sum(1 for ch in ai_cat2 if ch in entry["cat2"])
+                                similarity = overlap / max(len(entry["cat2"]), len(ai_cat2), 1)
+                                if similarity >= 0.8:
+                                    c1, c2 = entry["cat1"], entry["cat2"]
+                                    matched = True
+                                    break
+                        if not matched:
+                            c1, c2 = ai_cat1, ai_cat2
+                            is_new = ai_info.get("is_new_category", False)
+                            if is_new or (c1, c2) not in kb_pairs:
+                                if c1 not in ("其他", "", None) and c2 not in ("通用", "待分类", "", None):
+                                    if len(new_kb_records) < 3:
+                                        new_kb_records.add((c1, c2))
 
                     sentiment = int(ai_info.get("sentiment", 5))
                     heat = self._calc_heat(
@@ -698,6 +722,7 @@ class DailyBot(discord.Client):
                         "模块分类": c1,
                         "二级分类": c2,
                         "sentiment": sentiment,
+                        "具体建议": str(ai_info.get("suggestion_core") or ai_info.get("summary", t["title"])),
                         "AI短标题": str(ai_info.get("short_title") or ai_info.get("summary", t["title"]))[:10],
                         "AI核心总结": str(ai_info.get("summary", t["title"])),
                         "heat_score": heat,
@@ -743,6 +768,7 @@ class DailyBot(discord.Client):
                 "模块分类": old_category,
                 "二级分类": old_sub_category,
                 "sentiment": old_sentiment,
+                "具体建议": old_summary,
                 "AI短标题": old_short_title,
                 "AI核心总结": old_summary,
                 "heat_score": heat,
@@ -875,9 +901,19 @@ class DailyBot(discord.Client):
 
             short_title = str(item.get("AI短标题", ""))[:10] or str(item.get("title", ""))[:10]
             summary = str(item.get("AI核心总结", ""))[:60]
+            suggestion = str(item.get("具体建议", "")).strip()[:80]
             cat = str(item.get("模块分类", ""))
             sub_cat = str(item.get("二级分类", ""))
             tag = f"#{cat}-{sub_cat}" if cat and sub_cat else ""
+
+            # 构建左侧内容
+            left_elements = [
+                {"tag": "markdown", "content": f"<font color='{color}'>**{short_title}**</font>"},
+                {"tag": "markdown", "content": summary},
+            ]
+            if suggestion and suggestion != summary:
+                left_elements.append({"tag": "markdown", "content": f"> {suggestion}"})
+            left_elements.append({"tag": "note", "elements": [{"tag": "lark_md", "content": tag}]})
 
             return {
                 "tag": "column_set",
@@ -887,14 +923,7 @@ class DailyBot(discord.Client):
                         "width": "weighted",
                         "weight": 4,
                         "vertical_align": "top",
-                        "elements": [
-                            {
-                                "tag": "markdown",
-                                "content": f"<font color='{color}'>**{short_title}**</font>"
-                            },
-                            {"tag": "markdown", "content": summary},
-                            {"tag": "note", "elements": [{"tag": "lark_md", "content": tag}]},
-                        ],
+                        "elements": left_elements,
                     },
                     {
                         "tag": "column",
@@ -1023,19 +1052,7 @@ class DailyBot(discord.Client):
             })
 
 
-# ===================== 5. 辅助函数 =====================
-async def t_fetch_messages(thread, limit=10):
-    """获取 thread 内前 N 条消息（按时间正序）"""
-    messages = []
-    try:
-        async for m in thread.history(limit=limit, oldest_first=True):
-            messages.append(m)
-    except Exception:
-        pass
-    return messages
-
-
-# ===================== 6. 入口 =====================
+# ===================== 5. 入口 =====================
 if __name__ == "__main__":
     intents = discord.Intents.default()
     intents.message_content = True
