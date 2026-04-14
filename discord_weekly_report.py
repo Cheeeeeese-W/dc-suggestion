@@ -120,6 +120,14 @@ class FeishuClient:
         """
         if not self.token:
             return {}
+        def _parse_int(val, default=0):
+            if val is None:
+                return default
+            try:
+                return int(float(val))
+            except (ValueError, TypeError):
+                return default
+
         result = {}
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{CONF['BITABLE_TOKEN']}/tables/{CONF['BITABLE_TABLE_ID']}/records"
         headers = {"Authorization": f"Bearer {self.token}"}
@@ -136,15 +144,6 @@ class FeishuClient:
                     link = fields.get("帖子链接")
                     tid = self._extract_thread_id_from_url(link)
                     if tid:
-                        # 解析数字字段，兼容飞书返回的 int/float/str
-                        def _parse_int(val, default=0):
-                            if val is None:
-                                return default
-                            try:
-                                return int(float(val))
-                            except (ValueError, TypeError):
-                                return default
-
                         result[tid] = {
                             "record_id": item["record_id"],
                             "reply_count": _parse_int(fields.get("回复数"), 0),
@@ -480,9 +479,6 @@ class DailyBot(discord.Client):
                 # 统计回复数（首帖不算回复）
                 reply_count = max(0, (t.message_count or 1) - 1)
 
-                # 参与人数估算：用 t.message_count 近似（避免遍历 history）
-                participant_count = max(1, min(t.message_count or 1, 50))
-
                 # 表情统计
                 pos_reactions, neg_reactions = self._reaction_polarity_counts(msg)
                 total_reactions = sum(r.count for r in (msg.reactions or []))
@@ -557,7 +553,6 @@ class DailyBot(discord.Client):
             print("📭 无候选帖子进入深度分析")
 
         # 5. 增量判断：哪些帖子需要深度分析（数据源：Bitable）
-        now_str = datetime.now(timezone.utc).isoformat()
         need_analysis = []
         skip_analysis = []
 
@@ -742,6 +737,7 @@ class DailyBot(discord.Client):
                         "模块分类": "其他",
                         "二级分类": "通用",
                         "sentiment": 5,
+                        "具体建议": "无",
                         "AI短标题": "",
                         "AI核心总结": t.get("first_content", "")[:50],
                         "heat_score": heat,
@@ -754,7 +750,7 @@ class DailyBot(discord.Client):
             old_category = t.get("old_category", "其他") or "其他"
             old_sub_category = t.get("old_sub_category", "通用") or "通用"
             old_summary = t.get("old_summary", "") or t.get("first_content", "")[:50] or ""
-            old_short_title = t.get("old_short_title", "") or t.get("title", "")[:10] or ""
+            old_short_title = t.get("old_short_title", "") or ""
             heat = self._calc_heat(
                 t.get("message_count", 1),
                 t.get("total_reactions", 0),
