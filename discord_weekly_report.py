@@ -96,9 +96,14 @@ class FeishuClient:
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         records = [{"fields": {"模块分类": p[0], "二级分类": p[1], "关键字": ""}} for p in new_records]
         try:
-            requests.post(url, headers=headers, json={"records": records}, timeout=10)
-        except Exception:
-            pass
+            res = requests.post(url, headers=headers, json={"records": records}, timeout=10)
+            resp = res.json()
+            if resp.get("code") == 0:
+                print(f"📝 术语库新增 {len(records)} 条: {[f'{p[0]}-{p[1]}' for p in new_records]}")
+            else:
+                print(f"❌ 术语库新增失败: code={resp.get('code')} msg={resp.get('msg')}")
+        except Exception as e:
+            print(f"❌ 术语库新增异常: {e}")
 
     # ---- Bitable 主表 ----
     def _extract_thread_id_from_url(self, link_obj):
@@ -639,6 +644,7 @@ class DailyBot(discord.Client):
 2. category 和 sub_category 只输出单个最合适的分类（不要列表）
 3. summary 概括帖子讨论的核心问题是什么（只描述问题，不要写建议）
 4. suggestion_core 是玩家提出的具体改进方案，可以有多条用分号分隔（如"将X技能眩晕从3秒降至1.5秒；增加眩晕递减机制"）。如果帖子只描述了问题但没有提出建议，填"无"
+**重要：游戏内专有名词（技能名、物品名、角色名、模式名等）请保留英文原文，不要自行翻译。例如 Core Ember 就写 Core Ember，不要翻译成中文。上面的分类选项仅用于归类，不是游戏术语翻译参考。**
 5. short_title 必须是 10 字以内的中文短标题
 6. sentiment 为 1-10 分，分数越高代表玩家越满意（10 最满意，1 最愤怒）
    - 1-2：极度不满  3-4：明显不满  5-6：中性  7-8：比较满意  9-10：非常满意
