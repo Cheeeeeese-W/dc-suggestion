@@ -913,8 +913,8 @@ class DailyBot(discord.Client):
                 {"tag": "markdown", "content": title_md},
                 {"tag": "markdown", "content": summary},
             ]
-            if suggestion and suggestion != summary:
-                left_elements.append({"tag": "markdown", "content": f"> {suggestion}"})
+            if suggestion and suggestion not in ("无", "", summary):
+                left_elements.append({"tag": "markdown", "content": f"💡 **建议：**{suggestion}"})
             left_elements.append({"tag": "note", "elements": [{"tag": "lark_md", "content": tag}]})
 
             return {
