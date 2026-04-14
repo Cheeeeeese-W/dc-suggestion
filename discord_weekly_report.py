@@ -186,7 +186,6 @@ class FeishuClient:
             tid = str(e["thread_id"])
             fields = {
                 "日期": e.get("date_ms"),
-                "帖子标题": str(e.get("title", ""))[:100],
                 "模块分类": e.get("模块分类"),
                 "二级分类": e.get("二级分类"),
                 "具体建议": str(e.get("具体建议", "")),
