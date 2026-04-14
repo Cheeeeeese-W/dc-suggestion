@@ -901,13 +901,20 @@ class DailyBot(discord.Client):
             short_title = str(item.get("AI短标题", ""))[:10] or str(item.get("AI核心总结", ""))[:10]
             summary = str(item.get("AI核心总结", ""))[:60]
             suggestion = str(item.get("具体建议", "")).strip()[:80]
+            dc_link = str(item.get("帖子链接", ""))
             cat = str(item.get("模块分类", ""))
             sub_cat = str(item.get("二级分类", ""))
             tag = f"#{cat}-{sub_cat}" if cat and sub_cat else ""
 
+            # 标题带 Discord 跳转链接
+            if dc_link:
+                title_md = f"<font color='{color}'>**[{short_title}]({dc_link})**</font>"
+            else:
+                title_md = f"<font color='{color}'>**{short_title}**</font>"
+
             # 构建左侧内容
             left_elements = [
-                {"tag": "markdown", "content": f"<font color='{color}'>**{short_title}**</font>"},
+                {"tag": "markdown", "content": title_md},
                 {"tag": "markdown", "content": summary},
             ]
             if suggestion and suggestion != summary:
