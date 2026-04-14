@@ -722,7 +722,7 @@ class DailyBot(discord.Client):
                         "二级分类": c2,
                         "sentiment": sentiment,
                         "具体建议": str(ai_info.get("suggestion_core", "无")),
-                        "AI短标题": str(ai_info.get("short_title") or ai_info.get("summary", t["title"]))[:10],
+                        "AI短标题": str(ai_info.get("short_title") or ai_info.get("summary", ""))[:10],
                         "AI核心总结": str(ai_info.get("summary", t["title"])),
                         "heat_score": heat,
                         "filtered": False,
@@ -742,7 +742,7 @@ class DailyBot(discord.Client):
                         "模块分类": "其他",
                         "二级分类": "通用",
                         "sentiment": 5,
-                        "AI短标题": t["title"][:10],
+                        "AI短标题": "",
                         "AI核心总结": t.get("first_content", "")[:50],
                         "heat_score": heat,
                         "filtered": False,
@@ -898,7 +898,7 @@ class DailyBot(discord.Client):
             else:
                 rd_str = "0"
 
-            short_title = str(item.get("AI短标题", ""))[:10] or str(item.get("title", ""))[:10]
+            short_title = str(item.get("AI短标题", ""))[:10] or str(item.get("AI核心总结", ""))[:10]
             summary = str(item.get("AI核心总结", ""))[:60]
             suggestion = str(item.get("具体建议", "")).strip()[:80]
             cat = str(item.get("模块分类", ""))
@@ -1029,7 +1029,7 @@ class DailyBot(discord.Client):
                 {"tag": "hr"},
             ]
             for item in (new_list + change_list)[:10]:
-                short = str(item.get("AI短标题", item.get("title", "")))[:10]
+                short = str(item.get("AI短标题", "") or item.get("AI核心总结", ""))[:10]
                 s = item.get("sentiment", "-")
                 summary = str(item.get("AI核心总结", ""))[:60]
                 fallback_el.append({
