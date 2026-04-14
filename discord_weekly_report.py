@@ -685,26 +685,29 @@ class DailyBot(discord.Client):
 
                     ai_cat1 = _to_str(ai_info.get("category"), "其他")
                     ai_cat2 = _to_str(ai_info.get("sub_category"), "通用")
+                    is_new_flag = ai_info.get("is_new_category", False)
+                    print(f"  📌 [{t['thread_id']}] AI分类: {ai_cat1}/{ai_cat2} | is_new={is_new_flag}")
 
                     # 精确匹配参考表
                     if (ai_cat1, ai_cat2) in kb_pairs:
                         c1, c2 = ai_cat1, ai_cat2
+                        print(f"    → 精确匹配命中")
                     else:
                         # 没有精确匹配，尝试同 cat1 下的近似 cat2
                         matched = False
                         for entry in kb:
                             if entry["cat1"] == ai_cat1:
-                                # 简单字符重叠比较
                                 overlap = sum(1 for ch in ai_cat2 if ch in entry["cat2"])
                                 similarity = overlap / max(len(entry["cat2"]), len(ai_cat2), 1)
                                 if similarity >= 0.8:
                                     c1, c2 = entry["cat1"], entry["cat2"]
                                     matched = True
+                                    print(f"    → 近似匹配: {ai_cat2} ≈ {entry['cat2']} (相似度{similarity:.2f})")
                                     break
                         if not matched:
                             c1, c2 = ai_cat1, ai_cat2
-                            is_new = ai_info.get("is_new_category", False)
-                            if is_new or (c1, c2) not in kb_pairs:
+                            print(f"    → 未匹配，使用AI原始分类")
+                            if is_new_flag or (c1, c2) not in kb_pairs:
                                 if c1 not in ("其他", "", None) and c2 not in ("通用", "待分类", "", None):
                                     if len(new_kb_records) < 3:
                                         new_kb_records.add((c1, c2))
@@ -836,6 +839,10 @@ class DailyBot(discord.Client):
         feishu.sync_bitable(sync_list, existing=bitable_existing)
 
         # 11. 更新参考库
+        if new_kb_records:
+            print(f"📝 准备新增 {len(new_kb_records)} 个分类: {list(new_kb_records)}")
+        else:
+            print("📝 本次无新分类需要新增（AI 分类全部匹配到已有术语库）")
         feishu.add_new_reference(list(new_kb_records))
 
         # 12. 发送日报卡片
