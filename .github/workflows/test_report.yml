@@ -46,6 +46,7 @@ jobs:
         env:
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}

@@ -28,10 +28,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ===================== 1. 配置中心 =====================
+def _parse_channel_ids():
+    raw = os.getenv("DISCORD_CHANNEL_IDS") or os.getenv("DISCORD_CHANNEL_ID", "")
+    ids = [item.strip() for item in raw.replace(";", ",").split(",") if item.strip()]
+    if not ids:
+        raise RuntimeError("请配置 DISCORD_CHANNEL_IDS 或 DISCORD_CHANNEL_ID")
+    try:
+        return [int(item) for item in ids]
+    except ValueError as exc:
+        raise RuntimeError("DISCORD_CHANNEL_IDS 只能填写频道 ID，多个 ID 用英文逗号分隔") from exc
+
+
 def get_conf():
     return {
         "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
-        "CHANNEL_ID": int(os.getenv("DISCORD_CHANNEL_ID")),
+        "CHANNEL_IDS": _parse_channel_ids(),
         "AI_API_KEY": os.getenv("AI_API_KEY"),
         "AI_BASE_URL": os.getenv("AI_BASE_URL", "https://api.999789.best/v1"),
         "AI_MODEL": os.getenv("AI_MODEL", "gemini-1.5-flash"),
@@ -415,7 +426,27 @@ class DailyBot(discord.Client):
     # ==================== 主流程 ====================
     async def on_ready(self):
         print(f"🚀 V2 日报系统就绪: {self.user}")
-        channel = self.get_channel(CONF["CHANNEL_ID"])
+        channels = []
+        for channel_id in CONF["CHANNEL_IDS"]:
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(channel_id)
+                except Exception as e:
+                    print(f"⚠️ 无法读取频道 {channel_id}: {e}")
+                    continue
+            if not hasattr(channel, "threads") or not hasattr(channel, "archived_threads"):
+                print(f"⚠️ 频道 {channel_id} 不是帖子/论坛频道，已跳过")
+                continue
+            channels.append(channel)
+
+        if not channels:
+            print("❌ 没有可采集的 Discord 帖子频道，退出")
+            await self.close()
+            return
+
+        channel_names = ", ".join(f"#{getattr(c, 'name', c.id)}({c.id})" for c in channels)
+        print(f"📡 本次采集频道: {channel_names}")
         feishu = FeishuClient()
         base_url = CONF["AI_BASE_URL"].strip().rstrip("/")
         if not base_url.endswith("/v1"):
@@ -432,31 +463,46 @@ class DailyBot(discord.Client):
         # 2. 拉取帖子：活跃 + 归档，去重
         start_time, end_time = self.get_range()
         threads_map = {}  # thread_id -> thread 对象
+        thread_sources = {}  # thread_id -> 来源频道
 
-        # 2a. 活跃帖子（最近 7 天创建的）
-        for t in channel.threads:
-            if start_time <= t.created_at <= end_time:
-                threads_map[str(t.id)] = t
-        print(f"📡 活跃帖子: {len(threads_map)} 个")
+        # 2a/2b. 多频道拉取活跃帖子 + 归档帖子（最近 7 天创建的）
+        active_count = 0
+        archived_page_count = 0
+        for channel in channels:
+            source_name = f"#{getattr(channel, 'name', channel.id)}"
+            source_label = f"{source_name}({channel.id})"
+            channel_active_count = 0
+            channel_archived_pages = 0
 
-        # 2b. 归档帖子（最近 7 天创建的）
-        archived_count = 0
-        try:
-            before = end_time
-            for _ in range(20):  # 最多 20 页
-                got_any = False
-                async for t in channel.archived_threads(before=before, limit=100):
-                    got_any = True
+            for t in channel.threads:
+                if start_time <= t.created_at <= end_time:
                     tid = str(t.id)
-                    if tid not in threads_map and t.created_at >= start_time:
-                        threads_map[tid] = t
-                    before = min(before, t.created_at)
-                if not got_any:
-                    break
-                archived_count += 1
-        except Exception as e:
-            print(f"⚠️ 归档拉取异常: {e}")
-        print(f"📡 归档帖子: {archived_count} 页, 去重后总计 {len(threads_map)} 个")
+                    threads_map[tid] = t
+                    thread_sources[tid] = source_name
+                    channel_active_count += 1
+            active_count += channel_active_count
+
+            try:
+                before = end_time
+                for _ in range(20):  # 每个频道最多 20 页
+                    got_any = False
+                    async for t in channel.archived_threads(before=before, limit=100):
+                        got_any = True
+                        tid = str(t.id)
+                        if tid not in threads_map and t.created_at >= start_time:
+                            threads_map[tid] = t
+                            thread_sources[tid] = source_name
+                        before = min(before, t.created_at)
+                    if not got_any:
+                        break
+                    channel_archived_pages += 1
+            except Exception as e:
+                print(f"⚠️ {source_label} 归档拉取异常: {e}")
+
+            archived_page_count += channel_archived_pages
+            print(f"📡 {source_label}: 活跃帖子 {channel_active_count} 个, 归档 {channel_archived_pages} 页")
+
+        print(f"📡 多频道汇总: 活跃帖子 {active_count} 个, 归档 {archived_page_count} 页, 去重后总计 {len(threads_map)} 个")
 
         if not threads_map:
             print("📭 无帖子，退出")
@@ -519,6 +565,7 @@ class DailyBot(discord.Client):
                     "message_count": t.message_count or 1,
                     "created_at": t.created_at,
                     "is_archived": getattr(t, "archived", False),
+                    "source_channel": thread_sources.get(tid, ""),
                     "author_name": str(msg.author) if msg.author else "unknown",
                     "author_id": str(msg.author.id) if msg.author else "0",
                     "帖子链接": f"https://discord.com/channels/{t.guild.id}/{t.id}",
@@ -626,11 +673,11 @@ class DailyBot(discord.Client):
                 cat_options.setdefault(e["cat1"], set()).add(e["cat2"])
             ref_guide = "\n".join([f"- {c1} > {' | '.join(sorted(c2s))}" for c1, c2s in cat_options.items()])
 
-            prompt = f"""分析《DarkWar》玩家建议帖，按以下步骤处理每个帖子：
+            prompt = f"""分析《DarkWar》玩家反馈、问题和建议帖，按以下步骤处理每个帖子：
 
 第1步 - 理解：玩家核心诉求是什么？
 第2步 - 分类：从分类选项中选择最匹配的分类
-第3步 - 提炼：用一句话写出具体可执行的建议
+第3步 - 提炼：如果玩家提出了具体方案，用一句话写出具体可执行的建议；如果只反馈问题，标记为"无"
 
 【分类规则】：
 1. 优先从以下已有分类中选择：
@@ -642,7 +689,7 @@ class DailyBot(discord.Client):
 【输出要求】：
 1. 输出必须为简体中文的 JSON 数组
 2. category 和 sub_category 只输出单个最合适的分类（不要列表）
-3. summary 概括帖子讨论的核心问题是什么（只描述问题，不要写建议）
+3. summary 概括帖子讨论的核心问题或反馈点是什么（只描述问题，不要写建议）
 4. suggestion_core 是玩家提出的具体改进方案，可以有多条用分号分隔（如"将X技能眩晕从3秒降至1.5秒；增加眩晕递减机制"）。如果帖子只描述了问题但没有提出建议，填"无"
 **重要翻译规则：所有输出内容必须是完整的中文，不允许出现英文句子或短语。游戏专有名词也必须翻译成中文，可在中文后括号注明英文原文，例如"核心余烬(Core Ember)"、"黑金(Black Gold)"。上面的分类选项仅用于归类，不是游戏术语翻译参考。**
 5. short_title 必须是 10 字以内的中文短标题
@@ -876,7 +923,7 @@ class DailyBot(discord.Client):
     async def send_daily_card(self, new_list, change_list, feishu, report_date, total_count):
         el = [{
             "tag": "markdown",
-            "content": f"**📊 {report_date} Discord 建议日报**\n今日采集帖子：**{total_count}** 个"
+            "content": f"**📊 {report_date} Discord 反馈日报**\n今日采集帖子：**{total_count}** 个"
         }]
 
         def build_thread_element(item):
@@ -927,7 +974,7 @@ class DailyBot(discord.Client):
                 {"tag": "markdown", "content": summary},
             ]
             if suggestion and suggestion not in ("无", "", summary):
-                left_elements.append({"tag": "markdown", "content": f"💡 **建议：**{suggestion}"})
+                left_elements.append({"tag": "markdown", "content": f"💡 **建议/诉求：**{suggestion}"})
             left_elements.append({"tag": "note", "elements": [{"tag": "lark_md", "content": tag}]})
 
             return {
@@ -1032,7 +1079,7 @@ class DailyBot(discord.Client):
 
         card_payload = {
             "header": {
-                "title": {"tag": "plain_text", "content": f"🗓️ {report_date} Discord 建议日报"},
+                "title": {"tag": "plain_text", "content": f"🗓️ {report_date} Discord 反馈日报"},
                 "template": template,
             },
             "elements": el,
@@ -1041,7 +1088,7 @@ class DailyBot(discord.Client):
         if not ok:
             # 降级：简版卡片
             fallback_el = [
-                {"tag": "markdown", "content": f"**📊 {report_date} Discord 建议日报**\n采集帖子：{total_count}"},
+                {"tag": "markdown", "content": f"**📊 {report_date} Discord 反馈日报**\n采集帖子：{total_count}"},
                 {"tag": "hr"},
             ]
             for item in (new_list + change_list)[:10]:
@@ -1060,7 +1107,7 @@ class DailyBot(discord.Client):
             }]})
             feishu.send_group_card({
                 "header": {
-                    "title": {"tag": "plain_text", "content": f"🗓️ {report_date} Discord 建议日报"},
+                    "title": {"tag": "plain_text", "content": f"🗓️ {report_date} Discord 反馈日报"},
                     "template": "blue",
                 },
                 "elements": fallback_el,
